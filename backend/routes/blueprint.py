@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
-from typing import AsyncGenerator, Dict
+from typing import AsyncGenerator, Dict, Optional, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
@@ -26,7 +26,8 @@ from dependencies import (
     get_reranker,
     get_tavily,
 )
-from models.blueprint import BlueprintRequest, BlueprintResponse, SSEEvent
+from models.blueprint import BlueprintRequest, BlueprintResponse, SSEEvent, RetrySectionRequest
+from core.crag import _repair_section, _normalize_blueprint
 
 log      = logging.getLogger(__name__)
 router   = APIRouter(prefix="/api/blueprint", tags=["blueprint"])
@@ -34,17 +35,40 @@ settings = get_settings()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def _sse(event: str, step: str = "", node: str = "",
-         progress: int = 0, data=None, error: str = "") -> str:
+def _sse(
+    event: str,
+    step: str = "",
+    node: str = "",
+    stage: str = "",
+    section: str = "",
+    progress: int = 0,
+    data=None,
+    error: str = "",
+    generation_id: str = "",
+) -> str:
     """Format a single SSE frame."""
     payload = SSEEvent(
-        event=event, step=step, node=node,
-        progress=progress, data=data, error=error,
+        event=event,
+        step=step,
+        node=node or stage or section,
+        stage=stage,
+        section=section,
+        progress=progress,
+        data=data,
+        error=error,
+        generation_id=generation_id,
     ).model_dump(mode="json")
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _format_event_payload(payload: dict) -> str:
+    """Format a raw event dictionary from CRAG callback into an SSE frame."""
+    event_name = payload.get("event", "progress")
+    return f"data: {json.dumps(payload)}\n\n"
+
+
 async def _stream_blueprint(
+    request: Request,
     body: BlueprintRequest,
     user: Dict,
     collections: Dict,
@@ -56,24 +80,37 @@ async def _stream_blueprint(
     gpt_oss,
 ) -> AsyncGenerator[str, None]:
     """
-    Async generator that runs the CRAG pipeline and yields SSE frames.
-    The frontend reads these frames to show a real-time progress bar.
+    Async generator that runs the CRAG pipeline and yields SSE frames in genuine real-time.
+    Uses an asyncio.Queue to stream incremental stage and section events from the worker thread.
     """
-    import sys, os
+    import sys, os, uuid, time, threading, asyncio
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "core"))
 
+    generation_id = f"gen_{uuid.uuid4().hex[:12]}"
+    t_init = time.time()
+    loop = asyncio.get_running_loop()
+    event_queue: asyncio.Queue = asyncio.Queue()
+    cancel_event = threading.Event()
+
+    log.info(f"[CRAG Stream] Starting generation_id={generation_id} for user={user.get('email')}")
+
     try:
-        # ── Step 1: Query rewriting (Gemini Flash) ────────────────────────────
-        yield _sse("progress", step="Rewriting query with Gemini Flash…",
-                   node="rewrite_query", progress=8)
+        # Initial event notifying client of generation start
+        yield _sse(
+            event="generation_started",
+            generation_id=generation_id,
+            step="Initializing blueprint generation pipeline…",
+            progress=2,
+            data={"generation_id": generation_id, "idea": body.idea},
+        )
 
         from crag import run_crag
-        # run_crag is CPU/IO-bound — run in a thread so we don't block the event loop
-        import asyncio
-        loop = asyncio.get_event_loop()
 
-        # We use a mutable dict to pass partial progress updates out of the thread
-        progress_updates = []
+        def _event_cb(ev_type: str, payload: dict):
+            payload["generation_id"] = generation_id
+            if "event" not in payload:
+                payload["event"] = ev_type
+            loop.call_soon_threadsafe(event_queue.put_nowait, payload)
 
         def _run():
             return run_crag(
@@ -89,51 +126,35 @@ async def _stream_blueprint(
                 groq_client=groq_client,
                 gemini_client=gemini,
                 gpt_oss_client=gpt_oss,
+                event_callback=_event_cb,
+                cancel_event=cancel_event,
+                generation_id=generation_id,
             )
 
-        # ── Step 2: Retrieval ─────────────────────────────────────────────────
-        yield _sse("progress", step="Retrieving from ChromaDB (text + table + visual)…",
-                   node="retrieve", progress=18)
+        fut = loop.run_in_executor(None, _run)
 
-        # ── Step 3: Grading ───────────────────────────────────────────────────
-        yield _sse("progress", step="CrossEncoder grading retrieved chunks…",
-                   node="eval_each_doc", progress=28)
+        # Stream events from queue as they arrive
+        while not fut.done() or not event_queue.empty():
+            if await request.is_disconnected():
+                log.info(f"[CRAG Stream] Client disconnected for generation_id={generation_id}. Signalling cancellation.")
+                cancel_event.set()
+                return
 
-        # Run the full CRAG pipeline in a thread pool
-        crag_result = await loop.run_in_executor(None, _run)
+            try:
+                ev_payload = await asyncio.wait_for(event_queue.get(), timeout=8.0)
+                yield _format_event_payload(ev_payload)
+            except asyncio.TimeoutError:
+                # Reverse-proxy keepalive comment to prevent Railway/Vercel timeout
+                yield ": keepalive\n\n"
 
-        confidence = crag_result["confidence"]
+        # Obtain final result
+        crag_result = await fut
+        if cancel_event.is_set():
+            return
 
-        # ── Step 4: Branch-specific message ──────────────────────────────────
-        branch_msgs = {
-            "CORRECT":   ("Refining PDF context (sentence strips)…",  "refine"),
-            "AMBIGUOUS": ("Combining PDF + Tavily web search…",        "web_search"),
-            "INCORRECT": ("PDF insufficient — searching live web…",    "web_search"),
-        }
-        msg, node = branch_msgs.get(confidence, ("Processing…", "branch"))
-        yield _sse("progress", step=msg, node=node, progress=45)
-
-        # ── Step 5: IBM Granite policy summary ───────────────────────────────
-        if crag_result["should_generate_blueprint"]:
-            yield _sse("progress", step="IBM Granite 4.0 synthesizing policy brief…",
-                       node="generate", progress=55)
-
-        # ── Step 6: Groq blueprint sections ──────────────────────────────────
+        confidence = crag_result.get("confidence", "")
         blueprint_data = {}
-        if crag_result["should_generate_blueprint"]:
-            yield _sse("progress", step="Groq generating Business Model Canvas…",
-                       node="generate_bmc", progress=62)
-            yield _sse("progress", step="Groq generating budget estimate…",
-                       node="generate_budget", progress=70)
-            yield _sse("progress", step="Groq generating Go-to-Market strategy…",
-                       node="generate_gtm", progress=76)
-            yield _sse("progress", step="Groq generating investor & scheme matches…",
-                       node="generate_investors", progress=82)
-            yield _sse("progress", step="Groq generating competitor analysis…",
-                       node="generate_competitors", progress=88)
-            yield _sse("progress", step="Groq generating risk assessment…",
-                       node="generate_risks", progress=93)
-
+        if crag_result.get("should_generate_blueprint"):
             bp = crag_result.get("blueprint", {})
             blueprint_data = {
                 "bmc":         bp.get("bmc", {}),
@@ -146,14 +167,21 @@ async def _stream_blueprint(
                 "crag_trace":  bp.get("crag_trace", {}),
             }
 
-        # ── Step 7: Save to history ───────────────────────────────────────────
-        yield _sse("progress", step="Saving blueprint to history…",
-                   node="save", progress=97)
+        # ── Database persistence ──────────────────────────────────────────────
+        yield _sse(
+            event="stage_started",
+            stage="save",
+            node="save",
+            step="Saving blueprint to history…",
+            progress=97,
+            generation_id=generation_id,
+        )
 
         bp = crag_result.get("blueprint", {})
         failed_sections = bp.get("failed_sections", [])
         bp_status = bp.get("status", "partial" if failed_sections else "success")
 
+        t0_db = time.time()
         blueprint_id = None
         try:
             from history import save_blueprint_to_history
@@ -175,11 +203,17 @@ async def _stream_blueprint(
         except Exception as e:
             log.warning(f"Failed to save blueprint to history: {e}")
 
-        # ── Step 8: Complete ──────────────────────────────────────────────────
+        t_db = time.time() - t0_db
+        timings = crag_result.get("timings", {})
+        timings["request_init_s"] = round(time.time() - t_init, 2)
+        timings["database_persistence_s"] = round(t_db, 2)
+
+        # ── Final complete event ──────────────────────────────────────────────
         now_ts = datetime.utcnow().isoformat()
         response = BlueprintResponse(
             blueprint_id=blueprint_id,
             id=blueprint_id,
+            generation_id=generation_id,
             idea=body.idea,
             original_query=body.idea,
             sector=body.sector,
@@ -196,6 +230,7 @@ async def _stream_blueprint(
             sources=crag_result.get("sources", []),
             keywords=crag_result.get("keywords", []),
             raw_logits=crag_result.get("raw_logits", []),
+            timings=timings,
             blueprint=blueprint_data,
             bmc_data=blueprint_data.get("bmc", {}),
             budget_data=blueprint_data.get("budget", {}),
@@ -207,12 +242,23 @@ async def _stream_blueprint(
             generated_at=now_ts,
             timestamp=now_ts,
         )
-        yield _sse("complete", step="Blueprint ready!", progress=100,
-                   data=response.model_dump(mode="json"))
+
+        yield _sse(
+            event="generation_completed",
+            step="Blueprint ready!",
+            progress=100,
+            data=response.model_dump(mode="json"),
+            generation_id=generation_id,
+        )
 
     except Exception as e:
         log.error(f"Blueprint generation failed: {e}", exc_info=True)
-        yield _sse("error", error=str(e), progress=0)
+        yield _sse(
+            event="generation_failed",
+            error=str(e),
+            progress=0,
+            generation_id=generation_id,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -221,6 +267,7 @@ async def _stream_blueprint(
 
 @router.post("/generate")
 async def generate_blueprint(
+    request: Request,
     body: BlueprintRequest,
     current_user: Dict = Depends(get_current_user),
     collections  = Depends(get_collections),
@@ -235,14 +282,14 @@ async def generate_blueprint(
     Stream blueprint generation progress as Server-Sent Events.
 
     Frontend connects with:
-        const es = new EventSource('/api/blueprint/generate', { method: 'POST', ... })
-    Or more practically, uses fetch() + ReadableStream to read the SSE response.
+        const ctrl = generateBlueprint(payload, { onProgress, onSection, onStage, onComplete, onError })
 
     Each SSE frame is a JSON object matching the SSEEvent schema:
-        { event, step, node, progress, data, error }
+        { event, step, node, stage, section, progress, data, error, generation_id }
     """
     return StreamingResponse(
         _stream_blueprint(
+            request=request,
             body=body,
             user=current_user,
             collections=collections,
@@ -296,3 +343,79 @@ async def get_news(q: str = "India startup funding"):
     except Exception as e:
         log.warning(f"News fetch failed: {e}")
         return {"articles": []}
+
+
+@router.post("/retry-section")
+@router.post("/{blueprint_id}/retry-section")
+async def retry_section(
+    body: RetrySectionRequest,
+    blueprint_id: Optional[int] = None,
+    current_user: Dict = Depends(get_current_user),
+    groq_client  = Depends(get_groq),
+    gpt_oss      = Depends(get_gpt_oss),
+):
+    """
+    Regenerate ONLY the requested blueprint section without rerunning the entire pipeline.
+    Preserves all other successfully generated sections.
+    """
+    sec_name = body.section.lower().strip()
+    # Map common aliases
+    if sec_name in ("funding", "investor", "investors"):
+        sec_name = "investors"
+    elif sec_name in ("competitor", "competitors"):
+        sec_name = "competitors"
+    elif sec_name in ("risk", "risks"):
+        sec_name = "risks"
+
+    b_id = blueprint_id or body.blueprint_id
+    idea_text = body.idea or ""
+    evidence_text = f"Sector: {body.sector}. Model: {body.model_type}. Target City: {body.target_city}."
+    sources_text = "Official Indian Policy Documents & Regulations"
+
+    if b_id:
+        try:
+            from history import load_blueprint_for_display, history_db
+            existing_bp = load_blueprint_for_display(b_id)
+            if existing_bp:
+                idea_text = existing_bp.get("original_query") or existing_bp.get("idea") or idea_text
+                crag_res = existing_bp.get("crag_result") or {}
+                evidence_text = crag_res.get("summary") or crag_res.get("internal_context") or evidence_text
+                sources_text = ", ".join(existing_bp.get("sources") or []) or sources_text
+        except Exception as e:
+            log.warning(f"Could not load existing blueprint {b_id} for section retry: {e}")
+
+    if not idea_text:
+        raise HTTPException(status_code=400, detail="Idea is required for section regeneration.")
+
+    try:
+        new_sec_data = _repair_section(sec_name, idea_text, evidence_text, sources_text, groq_client, gpt_oss)
+        partial_bp = {sec_name: new_sec_data}
+        norm_bp = _normalize_blueprint(partial_bp)
+        canonical_sec = norm_bp.get(sec_name, new_sec_data)
+
+        if b_id:
+            try:
+                from history import history_db
+                bp_record = history_db.get_blueprint(b_id)
+                if bp_record and bp_record.get("sections"):
+                    secs = dict(bp_record["sections"])
+                    secs[sec_name] = canonical_sec
+                    if sec_name == "investors":
+                        secs["funding"] = canonical_sec
+                    failed_list = [f for f in secs.get("failed_sections", []) if f != sec_name]
+                    secs["failed_sections"] = failed_list
+                    secs["status"] = "partial" if failed_list else "success"
+                    history_db.update_blueprint(b_id, sections=secs)
+            except Exception as upd_err:
+                log.warning(f"Could not persist retried section {sec_name} to db: {upd_err}")
+
+        return {
+            "success": True,
+            "status": "success",
+            "section": sec_name,
+            "data": canonical_sec,
+            "blueprint_id": b_id,
+        }
+    except Exception as err:
+        log.error(f"Failed to retry section {sec_name}: {err}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Section regeneration failed: {err}")

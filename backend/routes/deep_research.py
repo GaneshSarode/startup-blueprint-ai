@@ -55,6 +55,8 @@ async def stream_deep_research_post(
     bp = load_blueprint_for_display(blueprint_id)
     if not bp:
         raise HTTPException(404, "Blueprint not found")
+    if current_user and current_user.get("email"):
+        bp["user_email"] = current_user.get("email")
 
     cached = get_cached_report(blueprint_id, norm_focus)
     if cached and not force_refresh:

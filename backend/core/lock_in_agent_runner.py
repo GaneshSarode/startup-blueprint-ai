@@ -553,8 +553,25 @@ def generate_recovery_recommendation_if_needed(analysis: Dict[str, Any], groq_cl
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN AGENT EXECUTION ENTRYPOINT
+# MAIN AGENT EXECUTION ENTRYPOINT & CONCURRENCY CONTROL
 # ══════════════════════════════════════════════════════════════════════════════
+
+import asyncio
+from lock_in_business_partner import (
+    get_or_create_context,
+    generate_daily_partner_briefing,
+    evaluate_safety_and_approval,
+)
+
+_project_locks: Dict[int, asyncio.Lock] = {}
+
+
+def get_project_lock(project_id: int) -> asyncio.Lock:
+    """Returns or creates a per-project asyncio lock to prevent concurrent scheduled/manual runs."""
+    if project_id not in _project_locks:
+        _project_locks[project_id] = asyncio.Lock()
+    return _project_locks[project_id]
+
 
 async def evaluate_and_execute_agent(
     project_id: int,
@@ -563,12 +580,35 @@ async def evaluate_and_execute_agent(
     groq_client=None
 ) -> Dict[str, Any]:
     """
-    Executes an accountability evaluation cycle for a project:
-      1. Performs deterministic progress and momentum analysis
-      2. Checks timezone-aware idempotency & user preferences
-      3. Sends appropriate email via Gmail API
-      4. Logs notification history and standardized activity events
+    Thread-safe, idempotent entrypoint for the LOCK IN Business Partner Agent.
+    Acquires a concurrency lock to guarantee non-overlapping execution.
     """
+    lock = get_project_lock(project_id)
+    if lock.locked():
+        log.warning(f"Project {project_id} execution lock already active. Skipping overlapping run.")
+        return {
+            "project_id": project_id,
+            "notification_type": notification_type,
+            "sent": False,
+            "reason": "Another agent evaluation cycle is currently in progress for this project.",
+        }
+
+    async with lock:
+        return await _execute_agent_cycle(
+            project_id=project_id,
+            notification_type=notification_type,
+            force_send=force_send,
+            groq_client=groq_client,
+        )
+
+
+async def _execute_agent_cycle(
+    project_id: int,
+    notification_type: str = "daily",
+    force_send: bool = False,
+    groq_client=None
+) -> Dict[str, Any]:
+    """Internal implementation of the business partner evaluation cycle."""
     analysis = analyze_project_progress(project_id)
     user_id = analysis["user_id"]
     user_email = analysis["user_email"]
@@ -592,84 +632,155 @@ async def evaluate_and_execute_agent(
         "reason": "",
     }
 
-    # 1. Check Gmail connection
+    # 1. Check emergency pause
+    if prefs.get("is_paused", False):
+        log.info(f"Project {project_id} has agent paused in preferences. Skipping.")
+        result["reason"] = "Agent paused by emergency stop preference."
+        return result
+
+    # 2. Check Gmail connection
     if not gmail_conn or gmail_conn.get("status") != "active":
-        result["reason"] = "Gmail not connected or inactive"
+        result["reason"] = "Gmail not connected or reauthorization required."
         return result
 
     recipient = gmail_conn.get("google_email") or user_email
     if not recipient:
-        result["reason"] = "No recipient email found"
+        result["reason"] = "No authenticated recipient email found"
         return result
 
-    # 2. Check Idempotency (unless forced)
+    # 3. Check Idempotency (unless forced)
     if not force_send and has_notification_been_sent_today(project_id, notification_type, local_date_str, user_tz_str):
         log.info(f"Notification '{notification_type}' already sent today for project {project_id}. Skipping.")
         result["reason"] = "Already sent today"
         return result
 
-    # 3. Generate email content based on notification type
+    # 4. Check user preferences for channel enablement
+    if notification_type == "daily" and not prefs.get("daily_reminder_enabled", True) and not force_send:
+        result["reason"] = "Daily reminder disabled in preferences"
+        return result
+    elif notification_type == "deadline" and not prefs.get("deadline_alert_enabled", True) and not force_send:
+        result["reason"] = "Deadline alerts disabled in preferences"
+        return result
+    elif notification_type == "weekly" and not prefs.get("weekly_report_enabled", True) and not force_send:
+        result["reason"] = "Weekly report disabled in preferences"
+        return result
+
+    # 5. Load persistent partner context and generate content
+    context = get_or_create_context(project_id, user_id)
+
     if notification_type == "daily":
-        if not prefs.get("daily_reminder_enabled", True) and not force_send:
-            result["reason"] = "Daily reminder disabled in preferences"
-            return result
         subject, text_body, html_body = generate_daily_email_content(analysis, groq_client)
         action_type = "DAILY_MISSION_SENT"
-
     elif notification_type == "deadline":
-        if not prefs.get("deadline_alert_enabled", True) and not force_send:
-            result["reason"] = "Deadline alerts disabled in preferences"
-            return result
         subject, text_body, html_body = generate_deadline_alert_content(analysis)
         action_type = "MILESTONE_ALERT_SENT"
-
     elif notification_type == "weekly":
-        if not prefs.get("weekly_report_enabled", True) and not force_send:
-            result["reason"] = "Weekly report disabled in preferences"
-            return result
         subject, text_body, html_body = generate_weekly_report_content(analysis)
         action_type = "WEEKLY_REPORT_SENT"
     else:
         subject, text_body, html_body = generate_daily_email_content(analysis, groq_client)
         action_type = "DAILY_MISSION_SENT"
 
-    # 4. Dispatch Email via Gmail REST API
-    try:
-        msg_id = await send_gmail_email(user_id, recipient, subject, text_body, html_body)
-        
-        # Record notification in database (idempotency ledger)
-        record_notification(
+    # 6. Safety & Approval Gate Check
+    can_auto_send, safety_reason = evaluate_safety_and_approval(
+        project_id=project_id,
+        user_id=user_id,
+        recipient=recipient,
+        subject=subject,
+        body_text=text_body,
+        workflow_type=notification_type,
+    )
+
+    should_dispatch_directly = force_send or can_auto_send
+
+    # If approval is required (default mode or policy restriction): create draft in Email Workspace
+    if not should_dispatch_directly:
+        from lock_in_db import create_email_draft
+        draft_id = create_email_draft(
             project_id=project_id,
             user_id=user_id,
-            notification_type=notification_type,
+            workflow_type=notification_type,
+            recipient=recipient,
             subject=subject,
-            status="sent",
-            provider_message_id=msg_id,
-            local_date=local_date_str,
+            body_text=text_body,
+            body_html=html_body,
+            context_data={"analysis_summary": f"Score: {analysis['lock_in_score']}, State: {analysis['agent_state']}"},
+            status="pending_approval",
+            requires_approval=True
         )
 
-        # Log activity entry with standardized action types
         create_agent_action(
             project_id=project_id,
             user_id=user_id,
-            action_type=action_type,
-            title=f"Sent {notification_type.capitalize()} Email: {subject}",
-            description=f"Delivered to {recipient} (Score: {analysis['lock_in_score']}/100, Streak: {analysis.get('current_streak', 0)}d, Status: {analysis['agent_state']})",
-            details={
-                "message_id": msg_id,
-                "score": analysis["lock_in_score"],
-                "streak": analysis.get("current_streak", 0),
-                "state": analysis["agent_state"],
-                "local_date": local_date_str,
-            },
-            requires_approval=False
+            action_type="EMAIL_DRAFT_PENDING_APPROVAL",
+            title=f"Prepared Draft ({notification_type.capitalize()}): {subject}",
+            description=f"Draft queued in Email Workspace. Policy: {safety_reason}",
+            details={"draft_id": draft_id, "recipient": recipient, "subject": subject},
+            requires_approval=True
         )
 
-        result["sent"] = True
-        result["message_id"] = msg_id
+        result["sent"] = False
+        result["draft_created"] = True
+        result["draft_id"] = draft_id
+        result["reason"] = f"Draft created in Email Workspace for approval: {safety_reason}"
+        return result
 
-    except Exception as e:
-        log.error(f"Failed to send {notification_type} email for project {project_id}: {e}")
+    # 7. Direct dispatch with bounded retries for transient errors
+    max_retries = 2
+    retry_delay = 1.0
+    last_exc = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            msg_id = await send_gmail_email(user_id, recipient, subject, text_body, html_body)
+            
+            # Record notification in idempotency ledger
+            record_notification(
+                project_id=project_id,
+                user_id=user_id,
+                notification_type=notification_type,
+                subject=subject,
+                status="sent",
+                provider_message_id=msg_id,
+                local_date=local_date_str,
+            )
+
+            # Log activity entry with standardized action types
+            create_agent_action(
+                project_id=project_id,
+                user_id=user_id,
+                action_type=action_type,
+                title=f"Sent {notification_type.capitalize()} Email: {subject}",
+                description=f"Delivered to {recipient} (Score: {analysis['lock_in_score']}/100, Streak: {analysis.get('current_streak', 0)}d, Status: {analysis['agent_state']})",
+                details={
+                    "message_id": msg_id,
+                    "score": analysis["lock_in_score"],
+                    "streak": analysis.get("current_streak", 0),
+                    "state": analysis["agent_state"],
+                    "local_date": local_date_str,
+                },
+                requires_approval=False
+            )
+
+            result["sent"] = True
+            result["message_id"] = msg_id
+            break
+
+        except Exception as e:
+            last_exc = e
+            err_str = str(e)
+            log.warning(f"[AGENT RUNNER] Send attempt {attempt + 1} failed for project {project_id}: {err_str}")
+
+            # Do NOT retry permanent authorization or scope errors
+            if "401" in err_str or "403" in err_str or "reauth" in err_str.lower():
+                break
+
+            if attempt < max_retries:
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2
+
+    if not result["sent"]:
+        log.error(f"Failed to send {notification_type} email for project {project_id} after retries: {last_exc}")
         record_notification(
             project_id=project_id,
             user_id=user_id,
@@ -677,12 +788,12 @@ async def evaluate_and_execute_agent(
             subject=subject,
             status="failed",
             local_date=local_date_str,
-            error=str(e)
+            error=str(last_exc)
         )
         result["sent"] = False
-        result["error"] = str(e)
+        result["error"] = str(last_exc)
 
-    # 5. Check if HITL recovery recommendation is warranted
+    # 8. Check if HITL recovery recommendation is warranted
     if prefs.get("recovery_enabled", True):
         rec_id = generate_recovery_recommendation_if_needed(analysis, groq_client)
         if rec_id:

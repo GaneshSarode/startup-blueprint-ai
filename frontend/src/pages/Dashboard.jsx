@@ -17,18 +17,18 @@ const STAGES  = ['Idea Stage','Pre-seed','Seed','Series A']
 const CITIES  = ['Pan India','Mumbai','Delhi','Bangalore','Pune','Hyderabad','Chennai']
 
 const CRAG_STEPS = [
-  { node: 'rewrite_query',       label: 'Gemini Flash — rewriting query into structured brief',     pct: 8  },
-  { node: 'retrieve',            label: 'ChromaDB — retrieving text + table + visual chunks',        pct: 18 },
-  { node: 'eval_each_doc',       label: 'CrossEncoder — grading chunk relevance (raw logits)',       pct: 28 },
-  { node: 'branch',              label: 'CRAG routing — CORRECT / AMBIGUOUS / INCORRECT branch',    pct: 42 },
-  { node: 'generate',            label: 'IBM Granite 4.0 — synthesizing policy brief',              pct: 55 },
-  { node: 'generate_bmc',        label: 'Groq Llama 3.3 — Business Model Canvas',                  pct: 62 },
-  { node: 'generate_budget',     label: 'Groq — Phase-wise budget estimation',                      pct: 70 },
-  { node: 'generate_gtm',        label: 'Groq — Go-to-Market strategy',                             pct: 76 },
-  { node: 'generate_investors',  label: 'Groq — Investors & government schemes',                    pct: 82 },
-  { node: 'generate_competitors','label': 'Groq — Competitor landscape analysis',                   pct: 88 },
-  { node: 'generate_risks',      label: 'Groq — Risk assessment matrix',                            pct: 93 },
-  { node: 'save',                label: 'Saving blueprint to history…',                             pct: 97 },
+  { node: 'rewrite_query', match: ['rewrite_query', 'rewrite'], label: 'Gemini Flash — rewriting query into structured brief', pct: 8 },
+  { node: 'retrieve', match: ['retrieve'], label: 'ChromaDB — retrieving text + table + visual chunks', pct: 18 },
+  { node: 'eval_each_doc', match: ['eval_each_doc', 'grading'], label: 'CrossEncoder — grading chunk relevance (single eval pass)', pct: 28 },
+  { node: 'branch', match: ['branch', 'routing'], label: 'CRAG routing — CORRECT / AMBIGUOUS / INCORRECT branch', pct: 42 },
+  { node: 'generate', match: ['generate', 'summary'], label: 'IBM Granite 4.0 — synthesizing policy brief', pct: 55 },
+  { node: 'generate_bmc', match: ['generate_bmc'], section: 'bmc', label: 'Groq / Watsonx — Business Model Canvas', pct: 65 },
+  { node: 'generate_budget', match: ['generate_budget'], section: 'budget', label: 'Groq / Watsonx — Phase-wise budget estimation', pct: 72 },
+  { node: 'generate_gtm', match: ['generate_gtm'], section: 'gtm', label: 'Groq / Watsonx — Go-to-Market strategy', pct: 78 },
+  { node: 'generate_investors', match: ['generate_investors'], section: 'investors', label: 'Groq / Watsonx — Investors & government schemes', pct: 84 },
+  { node: 'generate_competitors', match: ['generate_competitors'], section: 'competitors', label: 'Groq / Watsonx — Competitor landscape analysis', pct: 90 },
+  { node: 'generate_risks', match: ['generate_risks'], section: 'risks', label: 'Groq / Watsonx — Risk assessment matrix', pct: 95 },
+  { node: 'save', match: ['save', 'completed'], label: 'Saving blueprint to history…', pct: 98 },
 ]
 
 function RoadmapProgressWidget({ roadmap, onContinue, onViewBlueprint }) {
@@ -113,7 +113,9 @@ export default function Dashboard() {
   const { user }  = useAuthStore()
   const {
     current, generating, progress, currentStep, currentNode, error,
+    partialSections, runningSections, cragResult, timings,
     setGenerating, setProgress, setError, setBlueprint, setAbortCtrl, reset,
+    setSectionStarted, setPartialSection, setCragResult,
   } = useBlueprintStore()
 
   const [idea,           setIdea]           = useState('')
@@ -122,6 +124,7 @@ export default function Dashboard() {
   const [stage,          setStage]          = useState('Idea Stage')
   const [targetCity,     setTargetCity]     = useState('Pan India')
   const [showDebug,      setShowDebug]      = useState(true)
+  const [showSourcesModal, setShowSourcesModal] = useState(false)
   const [activeRoadmaps, setActiveRoadmaps] = useState([])
   const abortRef = useRef(null)
 
@@ -275,7 +278,23 @@ export default function Dashboard() {
     const ctrl = generateBlueprint(
       { idea, sector, model_type: modelType, stage, target_city: targetCity },
       {
-        onProgress: ({ step, node, progress: p }) => setProgress(p, step, node),
+        onStage: (event) => {
+          if (event.data?.crag_result) {
+            setCragResult(event.data.crag_result)
+          }
+        },
+        onSectionStarted: (section) => {
+          setSectionStarted(section)
+        },
+        onSection: (section, data) => {
+          setPartialSection(section, data)
+        },
+        onProgress: ({ step, node, progress: p, data }) => {
+          setProgress(p, step, node)
+          if (data?.crag_result) {
+            setCragResult(data.crag_result)
+          }
+        },
         onComplete: (data) => fetchGeneratedBlueprint(data),
         onError:    (msg)  => setError(msg),
       }
@@ -406,21 +425,64 @@ export default function Dashboard() {
 
           {/* Step trace */}
           <div className="space-y-1">
-            {CRAG_STEPS.map((step, i) => {
-              const done    = progress >= step.pct
-              const active  = step.node === currentNode
+            {CRAG_STEPS.map((step) => {
+              const hasSection = step.section && Boolean(partialSections[step.section])
+              const isSectionRunning = step.section && Boolean(runningSections[step.section])
+              const done    = hasSection || progress >= step.pct
+              const active  = isSectionRunning || (step.match ? step.match.includes(currentNode) : step.node === currentNode)
               return (
                 <div key={step.node}
                   className={`flex items-center gap-2.5 py-1 px-2 rounded-lg text-xs transition-all duration-200
-                    ${active ? 'bg-blue-500/10 text-blue-300' : done ? 'text-slate-500' : 'text-slate-700'}`}>
+                    ${active ? 'bg-blue-500/10 text-blue-300' : done ? 'text-slate-400' : 'text-slate-700'}`}>
                   <span className="w-4 text-center flex-shrink-0">
                     {active ? <Spinner size={12}/> : done ? '✅' : '○'}
                   </span>
-                  {step.label}
+                  <span>{step.label}</span>
+                  {hasSection && (
+                    <span className="ml-auto text-[0.68rem] text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-1.5 py-0.2 rounded-full font-mono">
+                      ready
+                    </span>
+                  )}
                 </div>
               )
             })}
           </div>
+
+          {/* ── LIVE INCREMENTAL STREAMING PREVIEW ── */}
+          {(Object.keys(partialSections).length > 0 || cragResult) && (
+            <div className="mt-6 border-t border-blue-500/15 pt-5 animate-fade-in">
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-xs font-bold text-blue-300 uppercase tracking-wider flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-blue-400 animate-ping" />
+                  Live Incremental Blueprint Stream
+                </div>
+                <span className="text-[0.72rem] text-blue-400 bg-blue-500/10 border border-blue-500/20 px-2.5 py-1 rounded-full font-semibold">
+                  {Object.keys(partialSections).length}/6 Sections Ready
+                </span>
+              </div>
+
+              {/* Incremental Rewrite card */}
+              {cragResult?.rewritten_query && (
+                <div className="mb-4">
+                  <RewriteCard text={cragResult.rewritten_query} />
+                </div>
+              )}
+
+              {/* Live Streaming Tabs */}
+              <BlueprintTabs
+                bmc={partialSections.bmc || {}}
+                budget={partialSections.budget || {}}
+                gtm={partialSections.gtm || {}}
+                investors={partialSections.investors || {}}
+                competitors={partialSections.competitors || {}}
+                risks={partialSections.risks || {}}
+                cragResult={cragResult || {}}
+                isGenerating={true}
+                partialSections={partialSections}
+                runningSections={runningSections}
+              />
+            </div>
+          )}
         </div>
       )}
 
@@ -436,6 +498,37 @@ export default function Dashboard() {
         <div className="mt-8 animate-slide-up">
           <Divider />
 
+          {/* Latency timing banner */}
+          {(current.timings || timings) && (() => {
+            const t = current.timings || timings
+            const stages = [
+              { label: 'Query Rewrite', val: t.query_rewrite_s },
+              { label: 'Retrieval',     val: t.retrieval_s },
+              { label: 'Grading',       val: t.cross_encoder_grading_s },
+              { label: 'Policy Brief',  val: t.granite_policy_summary_s },
+              { label: 'Sections',      val: t.blueprint_sections_s },
+            ].filter(s => s.val && s.val > 0)
+            return (
+              <div className="mb-5 px-4 py-3 rounded-xl bg-white/[0.025] border border-white/[0.06] animate-fade-in" style={{ display:'flex', flexWrap:'wrap', alignItems:'center', justifyContent:'space-between', gap:'0.75rem' }}>
+                <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                  <span style={{ fontSize:'0.78rem', fontWeight:700, color:'#34d399' }}>⚡</span>
+                  <span style={{ fontSize:'0.78rem', fontWeight:700, color:'#34d399' }}>Total Latency</span>
+                  <span style={{ fontFamily:'JetBrains Mono,monospace', fontSize:'0.82rem', fontWeight:700, color:'#6ee7b7' }}>{(t.total_duration_s || 0).toFixed(2)}s</span>
+                  <span style={{ fontSize:'0.68rem', color:'#475569' }}>(end-to-end)</span>
+                </div>
+                {stages.length > 0 && (
+                  <div style={{ display:'flex', flexWrap:'wrap', alignItems:'center', gap:'0.5rem 1rem' }}>
+                    {stages.map(({ label, val }) => (
+                      <span key={label} style={{ fontSize:'0.72rem', fontFamily:'JetBrains Mono,monospace', color:'#64748b' }}>
+                        <span style={{ color:'#94a3b8', fontWeight:500 }}>{label}:</span> {val.toFixed(2)}s
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )
+          })()}
+
           {/* Rewrite card */}
           {(current.crag_result?.rewritten_query || current.rewritten_query) && (
             <RewriteCard text={current.crag_result?.rewritten_query || current.rewritten_query} />
@@ -443,14 +536,7 @@ export default function Dashboard() {
 
           {/* Keywords */}
           {(current.crag_result?.keywords || current.keywords)?.length > 0 && (
-            <div className="mb-4">
-              <div className="text-[0.67rem] font-700 text-slate-500 uppercase tracking-wider mb-2">
-                🔑 Extracted Keywords
-              </div>
-              <div className="flex flex-wrap">
-                {(current.crag_result?.keywords || current.keywords).map((k) => <KeywordChip key={k}>{k}</KeywordChip>)}
-              </div>
-            </div>
+            <KeywordsSection keywords={current.crag_result?.keywords || current.keywords} />
           )}
 
           {/* CRAG debug */}
@@ -469,7 +555,13 @@ export default function Dashboard() {
           )}
 
           {/* Overview metrics */}
-          <SectionHeader>📊 Blueprint Overview</SectionHeader>
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:16, paddingTop:4 }}>
+            <div style={{ height:1, flex:1, background:'linear-gradient(90deg,transparent,rgba(255,255,255,0.062) 20%,rgba(255,255,255,0.062) 80%,transparent)' }} />
+            <div style={{ fontSize:'0.8rem', fontWeight:700, color:'#93c5fd', display:'flex', alignItems:'center', gap:6, flexShrink:0 }}>
+              <span>📊</span> Blueprint Overview
+            </div>
+            <div style={{ height:1, flex:1, background:'linear-gradient(90deg,rgba(255,255,255,0.062) 20%,transparent)' }} />
+          </div>
           <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
             <MetricCard value={(current.crag_result?.summary || current.summary) ? '✓' : '—'}
               label="Policy Brief" sub="IBM Granite" />
@@ -485,24 +577,44 @@ export default function Dashboard() {
             />
           </div>
 
-          {/* Badges row */}
-          <div className="flex flex-wrap gap-1.5 mb-5">
-            <Badge variant="blue">IBM Granite 4.0</Badge>
-            <Badge variant="purple">Groq Llama 3.3</Badge>
-            <Badge variant="amber">✨ Gemini Flash</Badge>
-            <Badge variant={
-              (current.crag_result?.confidence || current.confidence) === 'CORRECT' ? 'green' :
-              (current.crag_result?.confidence || current.confidence) === 'AMBIGUOUS' ? 'amber' : 'red'
-            }>
-              CRAG: {current.crag_result?.confidence || current.confidence}
-            </Badge>
-            {(current.crag_result?.used_web_fallback || current.used_web_fallback) && (
-              <Badge variant="red">🌐 Tavily Fallback</Badge>
+          {/* Unified Model Provenance & Grounding Bar */}
+          <div className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-xl bg-white/[0.02] border border-white/[0.06] mb-5">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[0.68rem] font-bold text-slate-500 uppercase tracking-wider mr-1">Provenance:</span>
+              <Badge variant="blue">IBM Granite 4.0</Badge>
+              <Badge variant="purple">Watsonx / Groq Llama 3.3</Badge>
+              <Badge variant="amber">✨ Gemini Flash</Badge>
+              <Badge variant={
+                (current.crag_result?.confidence || current.confidence) === 'CORRECT' ? 'green' :
+                (current.crag_result?.confidence || current.confidence) === 'AMBIGUOUS' ? 'amber' : 'red'
+              }>
+                CRAG: {current.crag_result?.confidence || current.confidence || 'VERIFIED'}
+              </Badge>
+              {(current.crag_result?.used_web_fallback || current.used_web_fallback) && (
+                <Badge variant="red">🌐 Tavily Fallback</Badge>
+              )}
+            </div>
+
+            {/* Sources Popover Trigger */}
+            {((current.crag_result?.sources || current.sources || []).length > 0) && (
+              <button
+                type="button"
+                onClick={() => setShowSourcesModal(true)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 text-xs font-semibold border border-blue-500/20 transition-all cursor-pointer shadow-sm"
+              >
+                <span>📚</span>
+                <span>{(current.crag_result?.sources || current.sources || []).length} Grounded Sources</span>
+              </button>
             )}
-            <span className="text-[0.71rem] text-slate-600 self-center ml-1">
-              Sources: {(current.crag_result?.sources || current.sources || []).join(', ') || '—'}
-            </span>
           </div>
+
+          {/* Sources Modal */}
+          {showSourcesModal && (
+            <SourcesModal
+              sources={current.crag_result?.sources || current.sources || []}
+              onClose={() => setShowSourcesModal(false)}
+            />
+          )}
 
           {/* 7-tab blueprint */}
           <BlueprintTabs
@@ -512,7 +624,7 @@ export default function Dashboard() {
             investors={current.blueprint?.investors || current.investor_data || {}}
             competitors={current.blueprint?.competitors || current.competitor_data || {}}
             risks={current.blueprint?.risks || current.risk_data || {}}
-            cragResult={current.crag_result || {
+            cragResult={current.crag_result || current.blueprint?.crag_trace || {
               confidence: current.confidence,
               summary: current.summary,
               sources: current.sources || [],
@@ -524,6 +636,7 @@ export default function Dashboard() {
               external_context: current.external_context || '',
             }}
             blueprintId={current.blueprint_id || current.id}
+            blueprint={current.blueprint || current}
           />
 
           {/* Mentor CTA */}
@@ -561,6 +674,40 @@ export default function Dashboard() {
 }
 
 // ── Local helpers ─────────────────────────────────────────────────────────────
+const KEYWORDS_VISIBLE = 8
+
+function KeywordsSection({ keywords = [] }) {
+  const [showAll, setShowAll] = useState(false)
+  const visible = showAll ? keywords : keywords.slice(0, KEYWORDS_VISIBLE)
+  const hasMore = keywords.length > KEYWORDS_VISIBLE
+  return (
+    <div style={{ marginBottom:16 }}>
+      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:8 }}>
+        <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+          <span style={{ fontSize:'0.8rem' }}>🔑</span>
+          <span style={{ fontSize:'0.72rem', fontWeight:700, color:'#64748b', textTransform:'uppercase', letterSpacing:'0.08em' }}>
+            Extracted Keywords
+          </span>
+          <span style={{ fontSize:'0.68rem', fontWeight:600, color:'#475569', background:'rgba(255,255,255,0.04)', border:'1px solid rgba(255,255,255,0.06)', borderRadius:99, padding:'1px 7px' }}>
+            {keywords.length}
+          </span>
+        </div>
+        {hasMore && (
+          <button
+            onClick={() => setShowAll(!showAll)}
+            style={{ fontSize:'0.72rem', fontWeight:600, color:'#60a5fa', background:'none', border:'none', cursor:'pointer', padding:0 }}
+          >
+            {showAll ? 'Show fewer ↑' : `Show all ${keywords.length} ↓`}
+          </button>
+        )}
+      </div>
+      <div style={{ display:'flex', flexWrap:'wrap', gap:4 }}>
+        {visible.map((k) => <KeywordChip key={k}>{k}</KeywordChip>)}
+      </div>
+    </div>
+  )
+}
+
 function SelectField({ label, value, onChange, options }) {
   return (
     <div>
@@ -593,5 +740,73 @@ function Toggle({ label, checked, onChange }) {
       </div>
       <span className="text-sm text-slate-400">{label}</span>
     </label>
+  )
+}
+
+function SourcesModal({ sources = [], onClose }) {
+  const sanitizeName = (src) => {
+    if (!src) return 'Official Document'
+    const clean = String(src).replace(/\\/g, '/').split('/').pop()
+    return clean || String(src)
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-fade-in">
+      <div className="bg-[#0e1424] border border-white/10 rounded-2xl max-w-lg w-full p-5 shadow-2xl space-y-4">
+        <div className="flex items-center justify-between pb-3 border-b border-white/10">
+          <div className="flex items-center gap-2">
+            <span className="text-lg" aria-hidden="true">📚</span>
+            <h3 className="text-sm font-bold text-white">Grounded Source Documents</h3>
+            <span className="text-xs px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 font-mono">
+              {sources.length} sources
+            </span>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-slate-400 hover:text-white p-1 rounded-lg transition-colors cursor-pointer text-sm"
+          >
+            ✕
+          </button>
+        </div>
+
+        <p className="text-xs text-slate-400">
+          The Corrective RAG pipeline retrieved and verified the following official Indian startup policy documents and market intelligence sources:
+        </p>
+
+        <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+          {sources.length === 0 ? (
+            <div className="text-xs text-slate-500 italic p-4 text-center">No external sources recorded</div>
+          ) : (
+            sources.map((src, i) => {
+              const isUrl = String(src).startsWith('http')
+              const name = sanitizeName(src)
+              return (
+                <div key={i} className="flex items-start gap-2.5 p-2.5 rounded-xl bg-white/[0.025] border border-white/[0.05]">
+                  <span className="text-sm flex-shrink-0 mt-0.5">{isUrl ? '🌐' : '📄'}</span>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-semibold text-slate-200 truncate">{name}</div>
+                    <div className="text-[0.68rem] text-slate-500 font-mono truncate">{isUrl ? src : 'Internal Knowledge Base (ChromaDB)'}</div>
+                  </div>
+                  {isUrl && (
+                    <a href={src} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-400 hover:underline flex-shrink-0">
+                      Open ↗
+                    </a>
+                  )}
+                </div>
+              )
+            })
+          )}
+        </div>
+
+        <div className="pt-2 flex justify-end">
+          <button
+            onClick={onClose}
+            className="px-4 py-2 text-xs font-semibold rounded-lg bg-white/10 hover:bg-white/15 text-slate-200 transition-colors cursor-pointer"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
   )
 }

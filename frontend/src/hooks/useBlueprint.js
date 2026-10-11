@@ -11,7 +11,9 @@ import { historyApi } from '../api/history'
 export function useBlueprint() {
   const {
     current, generating, progress, currentStep, currentNode, error,
+    partialSections, runningSections, cragResult, timings,
     setGenerating, setProgress, setError, setBlueprint, setAbortCtrl, reset,
+    setSectionStarted, setPartialSection, setCragResult,
   } = useBlueprintStore()
 
   const abortRef = useRef(null)
@@ -81,7 +83,23 @@ export function useBlueprint() {
     setGenerating(true)
 
     const ctrl = generateBlueprintApi(payload, {
-      onProgress: ({ step, node, progress: p }) => setProgress(p, step, node),
+      onStage: (event) => {
+        if (event.data?.crag_result) {
+          setCragResult(event.data.crag_result)
+        }
+      },
+      onSectionStarted: (section) => {
+        setSectionStarted(section)
+      },
+      onSection: (section, data) => {
+        setPartialSection(section, data)
+      },
+      onProgress: ({ step, node, progress: p, data }) => {
+        setProgress(p, step, node)
+        if (data?.crag_result) {
+          setCragResult(data.crag_result)
+        }
+      },
       onComplete: (data) => fetchGeneratedBlueprint(data),
       onError: (msg) => setError(msg),
     })
@@ -89,7 +107,7 @@ export function useBlueprint() {
     abortRef.current = ctrl
     setAbortCtrl(ctrl)
     return ctrl
-  }, [reset, setGenerating, setProgress, setBlueprint, setError, setAbortCtrl])
+  }, [reset, setGenerating, setProgress, setBlueprint, setError, setAbortCtrl, setSectionStarted, setPartialSection, setCragResult])
 
   const cancel = useCallback(() => {
     abortRef.current?.abort()
@@ -103,6 +121,10 @@ export function useBlueprint() {
     currentStep,
     currentNode,
     error,
+    partialSections,
+    runningSections,
+    cragResult,
+    timings,
     generate,
     cancel,
     reset,

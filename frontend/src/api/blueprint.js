@@ -3,6 +3,8 @@ import client from './client'
 export const blueprintApi = {
   getById: (id) => client.get(`/api/blueprint/${id}`),
   getNews:  (q) => client.get('/api/blueprint/news/feed', { params: { q } }),
+  retrySection: (payload) => client.post('/api/blueprint/retry-section', payload),
+  retrySectionById: (id, payload) => client.post(`/api/blueprint/${id}/retry-section`, payload),
 }
 
 /**
@@ -14,10 +16,15 @@ export const blueprintApi = {
  *
  * Returns an AbortController so the caller can cancel mid-stream.
  */
-export function generateBlueprint(payload, { onProgress, onComplete, onError }) {
+export function generateBlueprint(
+  payload,
+  { onProgress, onStage, onSection, onSectionStarted, onComplete, onError }
+) {
   const token = localStorage.getItem('access_token')
   const baseUrl = import.meta.env.VITE_API_URL || ''
   const ctrl = new AbortController()
+  let hasCompleted = false
+  let hasErrored = false
 
   fetch(`${baseUrl}/api/blueprint/generate`, {
     method:  'POST',
@@ -31,7 +38,10 @@ export function generateBlueprint(payload, { onProgress, onComplete, onError }) 
     .then(async (res) => {
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
-        onError(err.detail || `Server error ${res.status}`)
+        if (!hasErrored) {
+          hasErrored = true
+          onError?.(err.detail || `Server error ${res.status}`)
+        }
         return
       }
 
@@ -52,16 +62,49 @@ export function generateBlueprint(payload, { onProgress, onComplete, onError }) 
           if (!trimmed.startsWith('data: ')) continue
           try {
             const event = JSON.parse(trimmed.slice(6))
-            if (event.event === 'progress') {
-              onProgress(event)
-            } else if (event.event === 'complete') {
-              let payload = event.data
-              if (typeof payload === 'string') {
-                try { payload = JSON.parse(payload) } catch (e) {}
+            const eventType = event.event
+
+            if (eventType === 'progress') {
+              onProgress?.(event)
+            } else if (eventType === 'stage_started' || eventType === 'stage_completed') {
+              onStage?.(event)
+              onProgress?.({
+                step: event.message || event.stage,
+                node: event.stage,
+                progress: event.progress,
+                data: event.data,
+              })
+            } else if (eventType === 'section_started') {
+              onSectionStarted?.(event.section)
+              onProgress?.({
+                step: event.message || `Generating ${event.section}...`,
+                node: `generate_${event.section}`,
+                progress: event.progress,
+                section: event.section,
+              })
+            } else if (eventType === 'section_completed') {
+              onSection?.(event.section, event.data)
+              onProgress?.({
+                step: event.message || `Completed ${event.section}`,
+                node: `generate_${event.section}`,
+                progress: event.progress,
+                section: event.section,
+                data: event.data,
+              })
+            } else if (eventType === 'complete' || eventType === 'generation_completed') {
+              if (!hasCompleted) {
+                hasCompleted = true
+                let dataPayload = event.data
+                if (typeof dataPayload === 'string') {
+                  try { dataPayload = JSON.parse(dataPayload) } catch (e) {}
+                }
+                onComplete?.(dataPayload)
               }
-              onComplete(payload)
-            } else if (event.event === 'error') {
-              onError(event.error || 'Generation failed')
+            } else if (eventType === 'error' || eventType === 'generation_failed') {
+              if (!hasErrored) {
+                hasErrored = true
+                onError?.(event.error || event.message || 'Generation failed')
+              }
             }
           } catch (e) {
             console.warn('SSE parse error:', e)
@@ -70,7 +113,10 @@ export function generateBlueprint(payload, { onProgress, onComplete, onError }) 
       }
     })
     .catch((err) => {
-      if (err.name !== 'AbortError') onError(err.message || 'Network error')
+      if (err.name !== 'AbortError' && !hasErrored) {
+        hasErrored = true
+        onError?.(err.message || 'Network error')
+      }
     })
 
   return ctrl   // caller can call ctrl.abort() to cancel

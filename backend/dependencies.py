@@ -106,8 +106,23 @@ def _init_tavily(settings) -> None:
 def _init_reranker() -> None:
     global _reranker
     log.info("Loading CrossEncoder (ms-marco-MiniLM-L-6-v2)…")
+    try:
+        import torch
+        # Configure CPU threads safely for containerized environments (prevents OpenMP thread contention on Railway)
+        num_threads = min(4, max(1, os.cpu_count() or 1))
+        torch.set_num_threads(num_threads)
+        if hasattr(torch, "set_num_interop_threads"):
+            try:
+                torch.set_num_interop_threads(1)
+            except RuntimeError:
+                pass
+    except Exception as e:
+        log.warning(f"Could not configure torch threads: {e}")
+
     from sentence_transformers import CrossEncoder
     _reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    if hasattr(_reranker, "model") and hasattr(_reranker.model, "eval"):
+        _reranker.model.eval()
     log.info("✅ CrossEncoder loaded.")
 
 

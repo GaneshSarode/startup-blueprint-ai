@@ -221,16 +221,34 @@ from lock_in_db import (
     approve_agent_action,
     reject_agent_action,
     get_notifications,
+    create_email_draft,
+    get_email_draft,
+    get_project_email_drafts,
+    update_email_draft,
+    mark_email_draft_sent,
+    mark_email_draft_rejected,
+    record_notification,
+    create_agent_action,
 )
 from gmail_service import (
     build_google_auth_url,
     exchange_oauth_code,
     send_test_email,
     is_gmail_configured,
+    diagnose_gmail_status,
+    send_gmail_email,
 )
 from lock_in_agent_runner import (
     analyze_project_progress,
     evaluate_and_execute_agent,
+)
+from lock_in_business_partner import (
+    get_or_create_context,
+    update_context as bp_update_context,
+    generate_daily_partner_briefing,
+    generate_weekly_partner_review,
+    compose_email_draft,
+    prepare_or_send_action,
 )
 
 
@@ -248,6 +266,37 @@ class PreferencesUpdateRequest(BaseModel):
     recovery_enabled:       Optional[bool] = True
     reminder_time:          Optional[str] = "09:00"
     timezone:               Optional[str] = "Asia/Kolkata"
+    automation_mode:        Optional[str] = "approve_before_sending"
+    is_paused:              Optional[bool] = False
+    daily_send_limit:       Optional[int] = 5
+    trusted_contacts:       Optional[List[Dict[str, Any]]] = None
+
+
+class CreateDraftRequest(BaseModel):
+    workflow_type: str = "daily_briefing"
+    recipient: str = ""
+    subject: str = ""
+    body_text: str = ""
+    body_html: Optional[str] = ""
+    context_data: Optional[Dict[str, Any]] = None
+
+
+class UpdateDraftRequest(BaseModel):
+    recipient: Optional[str] = None
+    subject: Optional[str] = None
+    body_text: Optional[str] = None
+    body_html: Optional[str] = None
+    status: Optional[str] = None
+
+
+class UpdatePartnerContextRequest(BaseModel):
+    founder_profile: Optional[Dict[str, Any]] = None
+    weekly_priorities: Optional[List[Dict[str, Any]]] = None
+    commitments: Optional[List[Dict[str, Any]]] = None
+    decisions: Optional[List[Dict[str, Any]]] = None
+    pending_followups: Optional[List[Dict[str, Any]]] = None
+    blockers: Optional[List[Dict[str, Any]]] = None
+    trusted_contacts: Optional[List[Dict[str, Any]]] = None
 
 
 @router.post("/sync")
@@ -282,19 +331,14 @@ async def get_lock_in_status(
     current_user: Dict = Depends(get_current_user),
 ):
     """
-    Retrieves complete agent status: progress metrics, deterministic score, state,
-    Gmail connection status, preferences, pending recommendations, and recent activity.
+    Retrieves complete business partner status: progress metrics, deterministic score,
+    Gmail connection diagnostics, preferences, pending drafts, partner context, and recent activity.
     """
     user_id = current_user["id"]
     project = get_project(user_id, blueprint_id)
 
-    gmail_conn = get_gmail_connection(user_id)
-    gmail_status = {
-        "connected": bool(gmail_conn and gmail_conn.get("status") == "active"),
-        "google_email": gmail_conn.get("google_email") if gmail_conn else None,
-        "status": gmail_conn.get("status") if gmail_conn else "not_connected",
-        "oauth_configured": is_gmail_configured(),
-    }
+    # Detailed Gmail diagnosis with scopes and reconnect reasoning
+    gmail_status = diagnose_gmail_status(user_id)
 
     if not project:
         return {
@@ -302,6 +346,9 @@ async def get_lock_in_status(
             "gmail": gmail_status,
             "metrics": None,
             "preferences": None,
+            "partner_context": None,
+            "pending_drafts": [],
+            "drafts_count": 0,
             "pending_recommendations": [],
             "recent_activity": [],
         }
@@ -309,8 +356,11 @@ async def get_lock_in_status(
     project_id = project["id"]
     metrics = analyze_project_progress(project_id)
     prefs = db_get_preferences(project_id, user_id)
+    context = get_or_create_context(project_id, user_id)
+    pending_drafts = get_project_email_drafts(project_id, user_id, status="pending_approval", limit=10)
+    all_drafts = get_project_email_drafts(project_id, user_id, limit=50)
     pending_recs = get_pending_recommendations(project_id, user_id)
-    activities = get_agent_actions(project_id, user_id, limit=10)
+    activities = get_agent_actions(project_id, user_id, limit=15)
 
     return {
         "synced": True,
@@ -318,6 +368,10 @@ async def get_lock_in_status(
         "gmail": gmail_status,
         "metrics": metrics,
         "preferences": prefs,
+        "partner_context": context,
+        "pending_drafts": pending_drafts,
+        "drafts_count": len(pending_drafts),
+        "total_drafts_count": len(all_drafts),
         "pending_recommendations": pending_recs,
         "recent_activity": activities,
     }
@@ -355,7 +409,7 @@ async def gmail_oauth_callback(
 ):
     """
     Handles Google OAuth callback, exchanges authorization code for tokens,
-    persists credentials server-side, and redirects back to the LOCK IN page.
+    verifies granted scopes, persists credentials server-side, and redirects.
     """
     settings = get_settings()
     frontend_url = settings.FRONTEND_URL
@@ -379,14 +433,22 @@ async def gmail_oauth_callback(
         token_info = await exchange_oauth_code(code)
         save_gmail_connection(
             user_id=user_id,
-            user_email="", # Updated from google profile or user token
+            user_email="",
             google_email=token_info["google_email"],
             access_token=token_info["access_token"],
             refresh_token=token_info["refresh_token"],
             token_expiry=token_info["token_expiry"],
-            status="active"
+            status=token_info.get("status", "active"),
+            granted_scopes=token_info.get("granted_scopes", ""),
+            scope_verified=token_info.get("scope_verified", True),
+            last_error=token_info.get("last_error", "")
         )
-        target_path = f"/lock-in/{blueprint_id}?gmail=connected" if blueprint_id else "/home?gmail=connected"
+
+        if token_info.get("has_send_scope"):
+            target_path = f"/lock-in/{blueprint_id}?gmail=connected" if blueprint_id else "/home?gmail=connected"
+        else:
+            target_path = f"/lock-in/{blueprint_id}?gmail_error=scope_insufficient" if blueprint_id else "/home?gmail_error=scope_insufficient"
+
         return RedirectResponse(f"{frontend_url}{target_path}")
 
     except Exception as e:
@@ -400,15 +462,17 @@ async def send_test_notification(
     current_user: Dict = Depends(get_current_user),
 ):
     """
-    Sends a real verification test email through the user's connected Gmail account.
+    Sends a verification test email strictly to the authenticated user's own email address.
+    Fails with actionable diagnostics if gmail.send permission is missing.
     """
     user_id = current_user["id"]
     try:
         res = await send_test_email(user_id)
         return res
     except Exception as e:
-        log.error(f"Test email failed: {e}")
-        raise HTTPException(400, f"Failed to send test email: {str(e)}")
+        err_msg = str(e)
+        log.error(f"Test email failed: {err_msg}")
+        raise HTTPException(400, f"Failed to send test email: {err_msg}")
 
 
 @router.post("/gmail/disconnect")
@@ -423,6 +487,10 @@ async def disconnect_user_gmail(
     return {"status": "disconnected"}
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PREFERENCES & PARTNER CONTEXT ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
 @router.get("/{blueprint_id}/preferences")
 async def get_notification_preferences(
     blueprint_id: int,
@@ -431,7 +499,7 @@ async def get_notification_preferences(
     user_id = current_user["id"]
     project = get_project(user_id, blueprint_id)
     if not project:
-        raise HTTPException(404, "Lock-in project not found. Please generate or sync your roadmap first.")
+        raise HTTPException(404, "Lock-in project not found. Please sync your roadmap first.")
     prefs = db_get_preferences(project["id"], user_id)
     return prefs
 
@@ -451,6 +519,254 @@ async def update_notification_preferences(
     return updated
 
 
+@router.get("/{blueprint_id}/partner-context")
+async def get_business_partner_context(
+    blueprint_id: int,
+    current_user: Dict = Depends(get_current_user),
+):
+    """Retrieves persistent user context: goals, weekly priorities, commitments, blockers, followups."""
+    user_id = current_user["id"]
+    project = get_project(user_id, blueprint_id)
+    if not project:
+        raise HTTPException(404, "Lock-in project not found.")
+    ctx = get_or_create_context(project["id"], user_id)
+    return ctx
+
+
+@router.put("/{blueprint_id}/partner-context")
+async def update_business_partner_context(
+    blueprint_id: int,
+    body:         UpdatePartnerContextRequest,
+    current_user: Dict = Depends(get_current_user),
+):
+    """Updates user-editable persistent context."""
+    user_id = current_user["id"]
+    project = get_project(user_id, blueprint_id)
+    if not project:
+        raise HTTPException(404, "Lock-in project not found.")
+    
+    updates = body.model_dump(exclude_unset=True)
+    ctx = bp_update_context(project["id"], user_id, updates)
+    return ctx
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EMAIL WORKSPACE & DRAFTS MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/{blueprint_id}/drafts")
+async def get_email_drafts(
+    blueprint_id: int,
+    status:       Optional[str] = None,
+    current_user: Dict = Depends(get_current_user),
+):
+    """Returns email drafts for the Email Workspace, filterable by status."""
+    user_id = current_user["id"]
+    project = get_project(user_id, blueprint_id)
+    if not project:
+        return {"drafts": []}
+    drafts = get_project_email_drafts(project["id"], user_id, status=status, limit=50)
+    return {"drafts": drafts}
+
+
+@router.post("/{blueprint_id}/drafts")
+async def create_new_draft(
+    blueprint_id: int,
+    body:         CreateDraftRequest,
+    current_user: Dict = Depends(get_current_user),
+    groq_client = Depends(get_groq),
+):
+    """
+    Creates or synthesizes a new email draft in the Email Workspace.
+    If subject/body are not provided, generates them using business partner composer.
+    """
+    user_id = current_user["id"]
+    project = get_project(user_id, blueprint_id)
+    if not project:
+        raise HTTPException(404, "Project not found.")
+
+    subject = body.subject
+    body_text = body.body_text
+    body_html = body.body_html or ""
+
+    if not subject or not body_text:
+        analysis = analyze_project_progress(project["id"])
+        context = get_or_create_context(project["id"], user_id)
+        comp_sub, comp_txt, comp_html = compose_email_draft(
+            workflow_type=body.workflow_type,
+            recipient=body.recipient,
+            subject_hint=body.subject,
+            context_data=body.context_data or {
+                "week": analysis.get("current_week", 1),
+                "briefing": generate_daily_partner_briefing(analysis, context, groq_client),
+                "sender_name": "Founder",
+            },
+            groq_client=groq_client
+        )
+        subject = subject or comp_sub
+        body_text = body_text or comp_txt
+        body_html = body_html or comp_html
+
+    draft_id = create_email_draft(
+        project_id=project["id"],
+        user_id=user_id,
+        workflow_type=body.workflow_type,
+        recipient=body.recipient,
+        subject=subject,
+        body_text=body_text,
+        body_html=body_html,
+        context_data=body.context_data,
+        status="pending_approval",
+        requires_approval=True
+    )
+
+    draft = get_email_draft(draft_id, user_id)
+    return {"status": "created", "draft": draft}
+
+
+@router.put("/{blueprint_id}/drafts/{draft_id}")
+async def update_existing_draft(
+    blueprint_id: int,
+    draft_id:     int,
+    body:         UpdateDraftRequest,
+    current_user: Dict = Depends(get_current_user),
+):
+    """Updates an existing draft (recipient, subject, body)."""
+    user_id = current_user["id"]
+    project = get_project(user_id, blueprint_id)
+    if not project:
+        raise HTTPException(404, "Project not found.")
+
+    updated = update_email_draft(draft_id, user_id, body.model_dump(exclude_unset=True))
+    if not updated:
+        raise HTTPException(404, "Draft not found.")
+    return {"status": "updated", "draft": updated}
+
+
+@router.post("/{blueprint_id}/drafts/{draft_id}/send")
+async def approve_and_send_draft(
+    blueprint_id: int,
+    draft_id:     int,
+    current_user: Dict = Depends(get_current_user),
+):
+    """
+    Human-in-the-Loop (HITL) approval action:
+    Approves the draft and dispatches the exact email through the user's connected Gmail account.
+    """
+    user_id = current_user["id"]
+    project = get_project(user_id, blueprint_id)
+    if not project:
+        raise HTTPException(404, "Project not found.")
+
+    draft = get_email_draft(draft_id, user_id)
+    if not draft:
+        raise HTTPException(404, "Draft not found.")
+
+    if draft["status"] == "sent":
+        return {"status": "already_sent", "message_id": draft.get("sent_message_id")}
+
+    recipient = draft["recipient"]
+    subject = draft["subject"]
+    body_text = draft["body_text"]
+    body_html = draft.get("body_html") or ""
+
+    if not recipient:
+        raise HTTPException(400, "Draft has no recipient email address.")
+
+    try:
+        msg_id = await send_gmail_email(user_id, recipient, subject, body_text, body_html)
+        updated_draft = mark_email_draft_sent(draft_id, user_id, msg_id)
+
+        # Log notification & activity
+        record_notification(
+            project_id=project["id"],
+            user_id=user_id,
+            notification_type=draft["workflow_type"],
+            subject=subject,
+            status="sent",
+            provider_message_id=msg_id,
+            local_date=date.today().isoformat()
+        )
+
+        create_agent_action(
+            project_id=project["id"],
+            user_id=user_id,
+            action_type="EMAIL_SENT_APPROVED",
+            title=f"User Approved & Sent: {subject}",
+            description=f"Delivered to {recipient} (Msg ID: {msg_id})",
+            details={"draft_id": draft_id, "recipient": recipient, "message_id": msg_id},
+            requires_approval=False
+        )
+
+        return {"status": "sent", "message_id": msg_id, "draft": updated_draft}
+    except Exception as e:
+        log.error(f"Failed to send approved draft #{draft_id}: {e}")
+        mark_email_draft_rejected(draft_id, user_id, f"Send failed: {str(e)}")
+        raise HTTPException(400, f"Failed to send email: {str(e)}")
+
+
+@router.post("/{blueprint_id}/drafts/{draft_id}/discard")
+async def discard_email_draft(
+    blueprint_id: int,
+    draft_id:     int,
+    current_user: Dict = Depends(get_current_user),
+):
+    """Discards a draft without sending."""
+    user_id = current_user["id"]
+    project = get_project(user_id, blueprint_id)
+    if not project:
+        raise HTTPException(404, "Project not found.")
+
+    updated = update_email_draft(draft_id, user_id, {"status": "discarded"})
+    if not updated:
+        raise HTTPException(404, "Draft not found.")
+    return {"status": "discarded", "draft": updated}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ON-DEMAND BRIEFING & REVIEW ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/{blueprint_id}/briefing")
+async def get_daily_partner_briefing(
+    blueprint_id: int,
+    current_user: Dict = Depends(get_current_user),
+    groq_client = Depends(get_groq),
+):
+    """Calculates on-demand daily proactive briefing with top 3 priorities, deadlines, and blockers."""
+    user_id = current_user["id"]
+    project = get_project(user_id, blueprint_id)
+    if not project:
+        raise HTTPException(404, "Project not found.")
+
+    analysis = analyze_project_progress(project["id"])
+    context = get_or_create_context(project["id"], user_id)
+    briefing = generate_daily_partner_briefing(analysis, context, groq_client)
+    return {"briefing": briefing, "analysis": analysis}
+
+
+@router.get("/{blueprint_id}/weekly-review")
+async def get_weekly_partner_review_data(
+    blueprint_id: int,
+    current_user: Dict = Depends(get_current_user),
+    groq_client = Depends(get_groq),
+):
+    """Calculates weekly partner review: planned vs completed, bottlenecks, next week adjustments."""
+    user_id = current_user["id"]
+    project = get_project(user_id, blueprint_id)
+    if not project:
+        raise HTTPException(404, "Project not found.")
+
+    analysis = analyze_project_progress(project["id"])
+    context = get_or_create_context(project["id"], user_id)
+    review = generate_weekly_partner_review(analysis, context, groq_client)
+    return {"weekly_review": review, "analysis": analysis}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ACTIVITY & RECOMMENDATION ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
 @router.get("/{blueprint_id}/activity")
 async def get_project_activity_logs(
     blueprint_id: int,
@@ -461,8 +777,8 @@ async def get_project_activity_logs(
     if not project:
         return {"actions": [], "notifications": []}
     
-    actions = get_agent_actions(project["id"], user_id, limit=25)
-    notifications = get_notifications(project["id"], user_id, limit=25)
+    actions = get_agent_actions(project["id"], user_id, limit=30)
+    notifications = get_notifications(project["id"], user_id, limit=30)
     return {"actions": actions, "notifications": notifications}
 
 
@@ -488,15 +804,13 @@ async def approve_recommendation(
 ):
     """
     Human-in-the-Loop (HITL) approval:
-    Applies the proposed task moves/schedule adjustments to the roadmap in the database
-    and returns the updated roadmap.
+    Applies proposed task moves/schedule adjustments to roadmap in the DB.
     """
     user_id = current_user["id"]
     approved = approve_agent_action(action_id, user_id)
     if not approved:
         raise HTTPException(404, "Recommendation not found or already processed.")
     
-    # Reload fresh project with updated roadmap
     project = get_project(user_id, blueprint_id)
     return {
         "status": "approved",
@@ -511,9 +825,7 @@ async def reject_recommendation(
     action_id:    int,
     current_user: Dict = Depends(get_current_user),
 ):
-    """
-    Rejects the recommendation and preserves the roadmap without modification.
-    """
+    """Rejects recommendation and preserves roadmap schedule."""
     user_id = current_user["id"]
     rejected = reject_agent_action(action_id, user_id)
     if not rejected:
@@ -530,7 +842,7 @@ async def manually_trigger_agent_evaluation(
 ):
     """
     Manually triggers an agent evaluation cycle for testing / on-demand review.
-    Forces sending regardless of scheduled time window.
+    Forces sending to user's connected email regardless of scheduled time window.
     """
     user_id = current_user["id"]
     project = get_project(user_id, blueprint_id)

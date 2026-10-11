@@ -33,7 +33,7 @@ def _conn():
 
 
 def init_deep_research_table() -> None:
-    """Create deep_research table if it doesn't exist."""
+    """Create deep_research table if it doesn't exist, and add report_json column if missing."""
     with _conn() as c:
         cur = c.cursor()
         cur.execute("""
@@ -47,14 +47,19 @@ def init_deep_research_table() -> None:
             funding         TEXT,
             news_pulse      TEXT,
             sentiment       TEXT,
+            report_json     TEXT,
             created_at      TIMESTAMPTZ DEFAULT now()
         );
         """)
+        try:
+            cur.execute("ALTER TABLE deep_research ADD COLUMN IF NOT EXISTS report_json TEXT;")
+        except Exception:
+            pass
         c.commit()
 
 
 def save_deep_research(blueprint_id: int, user_email: str, data: dict) -> bool:
-    """Upsert deep research results. Returns True on success."""
+    """Upsert deep research results including full report_json. Returns True on success."""
     try:
         init_deep_research_table()
         with _conn() as c:
@@ -62,8 +67,8 @@ def save_deep_research(blueprint_id: int, user_email: str, data: dict) -> bool:
             cur.execute("""
                 INSERT INTO deep_research
                     (blueprint_id, user_email, competitor_data, market_sizing,
-                     swot, funding, news_pulse, sentiment)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                     swot, funding, news_pulse, sentiment, report_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (blueprint_id) DO UPDATE SET
                     competitor_data = EXCLUDED.competitor_data,
                     market_sizing   = EXCLUDED.market_sizing,
@@ -71,16 +76,18 @@ def save_deep_research(blueprint_id: int, user_email: str, data: dict) -> bool:
                     funding         = EXCLUDED.funding,
                     news_pulse      = EXCLUDED.news_pulse,
                     sentiment       = EXCLUDED.sentiment,
+                    report_json     = EXCLUDED.report_json,
                     created_at      = now()
             """, (
                 blueprint_id,
-                user_email,
-                json.dumps(data.get("competitors", {})),
-                json.dumps(data.get("market_sizing", {})),
-                json.dumps(data.get("swot", {})),
-                json.dumps(data.get("funding", {})),
-                json.dumps(data.get("news_pulse", {})),
-                data.get("news_pulse", {}).get("sentiment", "Neutral"),
+                user_email or "",
+                json.dumps(data.get("competitor_intelligence", data.get("competitors", {}))),
+                json.dumps(data.get("market_landscape", data.get("market_sizing", {}))),
+                json.dumps(data.get("critical_analysis", data.get("swot", {}))),
+                json.dumps(data.get("funding_landscape", data.get("funding", {}))),
+                json.dumps(data.get("market_pulse", {})),
+                data.get("news_pulse", {}).get("sentiment", "Neutral") if isinstance(data.get("news_pulse"), dict) else "Neutral",
+                json.dumps(data),
             ))
             c.commit()
         return True
@@ -102,12 +109,17 @@ def load_deep_research(blueprint_id: int) -> dict | None:
             row = cur.fetchone()
             if row is None:
                 return None
+            if row.get("report_json"):
+                try:
+                    return json.loads(row["report_json"])
+                except Exception:
+                    pass
             return {
-                "competitors":   json.loads(row["competitor_data"] or "{}"),
-                "market_sizing": json.loads(row["market_sizing"]   or "{}"),
-                "swot":          json.loads(row["swot"]            or "{}"),
-                "funding":       json.loads(row["funding"]         or "{}"),
-                "news_pulse":    json.loads(row["news_pulse"]      or "{}"),
+                "competitors":   json.loads(row.get("competitor_data") or "{}"),
+                "market_sizing": json.loads(row.get("market_sizing")   or "{}"),
+                "swot":          json.loads(row.get("swot")            or "{}"),
+                "funding":       json.loads(row.get("funding")         or "{}"),
+                "news_pulse":    json.loads(row.get("news_pulse")      or "{}"),
             }
     except Exception as e:
         print(f"[deep_research_db] Load failed: {e}")

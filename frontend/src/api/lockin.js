@@ -32,6 +32,38 @@ export const lockinApi = {
   updatePreferences: (blueprintId, prefs) =>
     client.put(`/api/lock-in/${blueprintId}/preferences`, prefs),
 
+  // Persistent Partner Context
+  getPartnerContext: (blueprintId) =>
+    client.get(`/api/lock-in/${blueprintId}/partner-context`),
+
+  updatePartnerContext: (blueprintId, context) =>
+    client.put(`/api/lock-in/${blueprintId}/partner-context`, context),
+
+  // Email Workspace & Outbound Drafts
+  getDrafts: (blueprintId, status) => {
+    const q = status ? `?status=${status}` : ''
+    return client.get(`/api/lock-in/${blueprintId}/drafts${q}`)
+  },
+
+  createDraft: (blueprintId, draftData) =>
+    client.post(`/api/lock-in/${blueprintId}/drafts`, draftData),
+
+  updateDraft: (blueprintId, draftId, updates) =>
+    client.put(`/api/lock-in/${blueprintId}/drafts/${draftId}`, updates),
+
+  sendDraft: (blueprintId, draftId) =>
+    client.post(`/api/lock-in/${blueprintId}/drafts/${draftId}/send`),
+
+  discardDraft: (blueprintId, draftId) =>
+    client.post(`/api/lock-in/${blueprintId}/drafts/${draftId}/discard`),
+
+  // Proactive Briefing & Weekly Review
+  getBriefing: (blueprintId) =>
+    client.get(`/api/lock-in/${blueprintId}/briefing`),
+
+  getWeeklyReview: (blueprintId) =>
+    client.get(`/api/lock-in/${blueprintId}/weekly-review`),
+
   // Activity & Notification Logs
   getActivity: (blueprintId) =>
     client.get(`/api/lock-in/${blueprintId}/activity`),

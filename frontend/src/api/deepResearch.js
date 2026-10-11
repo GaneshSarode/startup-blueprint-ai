@@ -10,8 +10,10 @@ export const deepResearchApi = {
   /**
    * Fetch cached deep research results for a blueprint.
    * @param {number} blueprintId
+   * @param {string} [focus]
    */
-  getResults: (blueprintId) => client.get(`/api/deep-research/${blueprintId}/results`),
+  getResults: (blueprintId, focus = 'FULL_STARTUP_ANALYSIS') => 
+    client.get(`/api/deep-research/${blueprintId}/results`, { params: { focus } }),
 
   /**
    * Stream deep research execution via fetch() + ReadableStream.

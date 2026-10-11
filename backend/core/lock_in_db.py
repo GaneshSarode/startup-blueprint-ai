@@ -146,6 +146,14 @@ def init_tables() -> None:
         );
         """)
 
+        # Migration: ensure preferences has automation_mode, is_paused, daily_send_limit, trusted_contacts
+        cur.execute("""
+        ALTER TABLE lockin_preferences ADD COLUMN IF NOT EXISTS automation_mode TEXT DEFAULT 'approve_before_sending';
+        ALTER TABLE lockin_preferences ADD COLUMN IF NOT EXISTS is_paused BOOLEAN DEFAULT FALSE;
+        ALTER TABLE lockin_preferences ADD COLUMN IF NOT EXISTS daily_send_limit INTEGER DEFAULT 5;
+        ALTER TABLE lockin_preferences ADD COLUMN IF NOT EXISTS trusted_contacts JSONB DEFAULT '[]'::jsonb;
+        """)
+
         # 4. Gmail OAuth Connections table
         cur.execute("""
         CREATE TABLE IF NOT EXISTS gmail_connections (
@@ -160,6 +168,13 @@ def init_tables() -> None:
             created_at      TIMESTAMPTZ DEFAULT now(),
             updated_at      TIMESTAMPTZ DEFAULT now()
         );
+        """)
+
+        # Migration: ensure granted_scopes, scope_verified, last_error exist in gmail_connections
+        cur.execute("""
+        ALTER TABLE gmail_connections ADD COLUMN IF NOT EXISTS granted_scopes TEXT DEFAULT '';
+        ALTER TABLE gmail_connections ADD COLUMN IF NOT EXISTS scope_verified BOOLEAN DEFAULT FALSE;
+        ALTER TABLE gmail_connections ADD COLUMN IF NOT EXISTS last_error TEXT DEFAULT '';
         """)
 
         # 5. Notifications history & idempotency tracking
@@ -200,6 +215,46 @@ def init_tables() -> None:
             approved_at         TIMESTAMPTZ,
             executed_at         TIMESTAMPTZ,
             rejected_at         TIMESTAMPTZ
+        );
+        """)
+
+        # 7. Partner Persistent Context table
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS lockin_partner_context (
+            id                  SERIAL PRIMARY KEY,
+            project_id          INTEGER REFERENCES lockin_projects(id) ON DELETE CASCADE UNIQUE,
+            user_id             TEXT NOT NULL,
+            founder_profile     JSONB DEFAULT '{}'::jsonb,
+            weekly_priorities   JSONB DEFAULT '[]'::jsonb,
+            commitments         JSONB DEFAULT '[]'::jsonb,
+            decisions           JSONB DEFAULT '[]'::jsonb,
+            pending_followups   JSONB DEFAULT '[]'::jsonb,
+            blockers            JSONB DEFAULT '[]'::jsonb,
+            trusted_contacts    JSONB DEFAULT '[]'::jsonb,
+            updated_at          TIMESTAMPTZ DEFAULT now()
+        );
+        """)
+
+        # 8. Email Workspace & Outbound Drafts table
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS lockin_email_drafts (
+            id                  SERIAL PRIMARY KEY,
+            project_id          INTEGER REFERENCES lockin_projects(id) ON DELETE CASCADE,
+            user_id             TEXT NOT NULL,
+            workflow_type       TEXT NOT NULL,
+            recipient           TEXT NOT NULL,
+            subject             TEXT NOT NULL,
+            body_text           TEXT NOT NULL,
+            body_html           TEXT DEFAULT '',
+            context_data        JSONB DEFAULT '{}'::jsonb,
+            status              TEXT DEFAULT 'pending_approval',
+            requires_approval   BOOLEAN DEFAULT TRUE,
+            sent_message_id     TEXT DEFAULT '',
+            error               TEXT DEFAULT '',
+            created_at          TIMESTAMPTZ DEFAULT now(),
+            updated_at          TIMESTAMPTZ DEFAULT now(),
+            approved_at         TIMESTAMPTZ,
+            sent_at             TIMESTAMPTZ
         );
         """)
 
@@ -350,7 +405,13 @@ def get_preferences(project_id: int, user_id: str = None) -> dict:
             cur.execute("SELECT * FROM lockin_preferences WHERE project_id = %s;", (project_id,))
         row = cur.fetchone()
         if row:
-            return dict(row)
+            res = dict(row)
+            if isinstance(res.get("trusted_contacts"), str):
+                try:
+                    res["trusted_contacts"] = json.loads(res["trusted_contacts"])
+                except Exception:
+                    res["trusted_contacts"] = []
+            return res
         
         # Default preferences if not found
         return {
@@ -361,31 +422,43 @@ def get_preferences(project_id: int, user_id: str = None) -> dict:
             "weekly_report_enabled": True,
             "recovery_enabled": True,
             "reminder_time": "09:00",
-            "timezone": "Asia/Kolkata"
+            "timezone": "Asia/Kolkata",
+            "automation_mode": "approve_before_sending",
+            "is_paused": False,
+            "daily_send_limit": 5,
+            "trusted_contacts": []
         }
 
 
 def update_preferences(project_id: int, user_id: str, prefs: dict) -> dict:
     init_tables()
+    trusted = prefs.get("trusted_contacts")
+    trusted_json = json.dumps(trusted) if trusted is not None else None
+
     with _conn() as c:
         cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
             INSERT INTO lockin_preferences (
                 project_id, user_id, email_enabled, daily_reminder_enabled,
                 deadline_alert_enabled, weekly_report_enabled, recovery_enabled,
-                reminder_time, timezone, updated_at
+                reminder_time, timezone, automation_mode, is_paused, daily_send_limit,
+                trusted_contacts, updated_at
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, now()
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s::jsonb, '[]'::jsonb), now()
             )
             ON CONFLICT (project_id)
             DO UPDATE SET
-                email_enabled = EXCLUDED.email_enabled,
-                daily_reminder_enabled = EXCLUDED.daily_reminder_enabled,
-                deadline_alert_enabled = EXCLUDED.deadline_alert_enabled,
-                weekly_report_enabled = EXCLUDED.weekly_report_enabled,
-                recovery_enabled = EXCLUDED.recovery_enabled,
-                reminder_time = EXCLUDED.reminder_time,
-                timezone = EXCLUDED.timezone,
+                email_enabled = COALESCE(EXCLUDED.email_enabled, lockin_preferences.email_enabled),
+                daily_reminder_enabled = COALESCE(EXCLUDED.daily_reminder_enabled, lockin_preferences.daily_reminder_enabled),
+                deadline_alert_enabled = COALESCE(EXCLUDED.deadline_alert_enabled, lockin_preferences.deadline_alert_enabled),
+                weekly_report_enabled = COALESCE(EXCLUDED.weekly_report_enabled, lockin_preferences.weekly_report_enabled),
+                recovery_enabled = COALESCE(EXCLUDED.recovery_enabled, lockin_preferences.recovery_enabled),
+                reminder_time = COALESCE(EXCLUDED.reminder_time, lockin_preferences.reminder_time),
+                timezone = COALESCE(EXCLUDED.timezone, lockin_preferences.timezone),
+                automation_mode = COALESCE(EXCLUDED.automation_mode, lockin_preferences.automation_mode),
+                is_paused = COALESCE(EXCLUDED.is_paused, lockin_preferences.is_paused),
+                daily_send_limit = COALESCE(EXCLUDED.daily_send_limit, lockin_preferences.daily_send_limit),
+                trusted_contacts = CASE WHEN %s IS NOT NULL THEN %s::jsonb ELSE lockin_preferences.trusted_contacts END,
                 updated_at = now()
             RETURNING *;
         """, (
@@ -396,11 +469,23 @@ def update_preferences(project_id: int, user_id: str, prefs: dict) -> dict:
             prefs.get("weekly_report_enabled", True),
             prefs.get("recovery_enabled", True),
             prefs.get("reminder_time", "09:00"),
-            prefs.get("timezone", "Asia/Kolkata")
+            prefs.get("timezone", "Asia/Kolkata"),
+            prefs.get("automation_mode", "approve_before_sending"),
+            prefs.get("is_paused", False),
+            prefs.get("daily_send_limit", 5),
+            trusted_json,
+            trusted_json,
+            trusted_json
         ))
         row = cur.fetchone()
         c.commit()
-        return dict(row)
+        res = dict(row)
+        if isinstance(res.get("trusted_contacts"), str):
+            try:
+                res["trusted_contacts"] = json.loads(res["trusted_contacts"])
+            except Exception:
+                res["trusted_contacts"] = []
+        return res
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -412,7 +497,8 @@ def get_gmail_connection(user_id: str) -> dict | None:
     with _conn() as c:
         cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
-            SELECT id, user_id, user_email, google_email, access_token, refresh_token, token_expiry, status, created_at, updated_at
+            SELECT id, user_id, user_email, google_email, access_token, refresh_token, token_expiry,
+                   status, granted_scopes, scope_verified, last_error, created_at, updated_at
             FROM gmail_connections
             WHERE user_id = %s;
         """, (user_id,))
@@ -420,13 +506,27 @@ def get_gmail_connection(user_id: str) -> dict | None:
         return dict(row) if row else None
 
 
-def save_gmail_connection(user_id: str, user_email: str, google_email: str, access_token: str, refresh_token: str, token_expiry, status: str = "active") -> dict:
+def save_gmail_connection(
+    user_id: str,
+    user_email: str,
+    google_email: str,
+    access_token: str,
+    refresh_token: str,
+    token_expiry,
+    status: str = "active",
+    granted_scopes: str = "",
+    scope_verified: bool = False,
+    last_error: str = ""
+) -> dict:
     init_tables()
     with _conn() as c:
         cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
-            INSERT INTO gmail_connections (user_id, user_email, google_email, access_token, refresh_token, token_expiry, status, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+            INSERT INTO gmail_connections (
+                user_id, user_email, google_email, access_token, refresh_token,
+                token_expiry, status, granted_scopes, scope_verified, last_error, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
             ON CONFLICT (user_id)
             DO UPDATE SET
                 user_email = EXCLUDED.user_email,
@@ -435,9 +535,15 @@ def save_gmail_connection(user_id: str, user_email: str, google_email: str, acce
                 refresh_token = COALESCE(EXCLUDED.refresh_token, gmail_connections.refresh_token),
                 token_expiry = EXCLUDED.token_expiry,
                 status = EXCLUDED.status,
+                granted_scopes = CASE WHEN EXCLUDED.granted_scopes <> '' THEN EXCLUDED.granted_scopes ELSE gmail_connections.granted_scopes END,
+                scope_verified = EXCLUDED.scope_verified,
+                last_error = EXCLUDED.last_error,
                 updated_at = now()
             RETURNING *;
-        """, (user_id, user_email, google_email, access_token, refresh_token, token_expiry, status))
+        """, (
+            user_id, user_email, google_email, access_token, refresh_token,
+            token_expiry, status, granted_scopes, scope_verified, last_error
+        ))
         row = cur.fetchone()
         c.commit()
         return dict(row)
@@ -455,16 +561,258 @@ def update_gmail_access_token(user_id: str, access_token: str, token_expiry) -> 
         c.commit()
 
 
-def mark_gmail_connection_revoked(user_id: str, status: str = "revoked") -> None:
+def update_gmail_scopes(user_id: str, granted_scopes: str, scope_verified: bool = True, status: str = "active", last_error: str = "") -> None:
     init_tables()
     with _conn() as c:
         cur = c.cursor()
         cur.execute("""
             UPDATE gmail_connections 
-            SET status = %s, updated_at = now()
+            SET granted_scopes = %s, scope_verified = %s, status = %s, last_error = %s, updated_at = now()
             WHERE user_id = %s;
-        """, (status, user_id))
+        """, (granted_scopes, scope_verified, status, last_error, user_id))
         c.commit()
+
+
+def mark_gmail_connection_revoked(user_id: str, status: str = "revoked", error: str = "") -> None:
+    init_tables()
+    with _conn() as c:
+        cur = c.cursor()
+        cur.execute("""
+            UPDATE gmail_connections 
+            SET status = %s, last_error = %s, updated_at = now()
+            WHERE user_id = %s;
+        """, (status, error, user_id))
+        c.commit()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PERSISTENT PARTNER CONTEXT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_partner_context(project_id: int, user_id: str) -> dict:
+    init_tables()
+    with _conn() as c:
+        cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT * FROM lockin_partner_context
+            WHERE project_id = %s AND user_id = %s;
+        """, (project_id, user_id))
+        row = cur.fetchone()
+        if row:
+            res = dict(row)
+            for k in ["founder_profile", "weekly_priorities", "commitments", "decisions", "pending_followups", "blockers", "trusted_contacts"]:
+                if isinstance(res.get(k), str):
+                    try:
+                        res[k] = json.loads(res[k])
+                    except Exception:
+                        pass
+            return res
+        return {
+            "project_id": project_id,
+            "user_id": user_id,
+            "founder_profile": {},
+            "weekly_priorities": [],
+            "commitments": [],
+            "decisions": [],
+            "pending_followups": [],
+            "blockers": [],
+            "trusted_contacts": [],
+        }
+
+
+def update_partner_context(project_id: int, user_id: str, context: dict) -> dict:
+    init_tables()
+    with _conn() as c:
+        cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            INSERT INTO lockin_partner_context (
+                project_id, user_id, founder_profile, weekly_priorities,
+                commitments, decisions, pending_followups, blockers, trusted_contacts, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+            ON CONFLICT (project_id)
+            DO UPDATE SET
+                founder_profile = COALESCE(EXCLUDED.founder_profile, lockin_partner_context.founder_profile),
+                weekly_priorities = COALESCE(EXCLUDED.weekly_priorities, lockin_partner_context.weekly_priorities),
+                commitments = COALESCE(EXCLUDED.commitments, lockin_partner_context.commitments),
+                decisions = COALESCE(EXCLUDED.decisions, lockin_partner_context.decisions),
+                pending_followups = COALESCE(EXCLUDED.pending_followups, lockin_partner_context.pending_followups),
+                blockers = COALESCE(EXCLUDED.blockers, lockin_partner_context.blockers),
+                trusted_contacts = COALESCE(EXCLUDED.trusted_contacts, lockin_partner_context.trusted_contacts),
+                updated_at = now()
+            RETURNING *;
+        """, (
+            project_id, user_id,
+            json.dumps(context.get("founder_profile", {})),
+            json.dumps(context.get("weekly_priorities", [])),
+            json.dumps(context.get("commitments", [])),
+            json.dumps(context.get("decisions", [])),
+            json.dumps(context.get("pending_followups", [])),
+            json.dumps(context.get("blockers", [])),
+            json.dumps(context.get("trusted_contacts", [])),
+        ))
+        row = cur.fetchone()
+        c.commit()
+        res = dict(row)
+        for k in ["founder_profile", "weekly_priorities", "commitments", "decisions", "pending_followups", "blockers", "trusted_contacts"]:
+            if isinstance(res.get(k), str):
+                try:
+                    res[k] = json.loads(res[k])
+                except Exception:
+                    pass
+        return res
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EMAIL WORKSPACE & OUTBOUND DRAFTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def create_email_draft(
+    project_id: int,
+    user_id: str,
+    workflow_type: str,
+    recipient: str,
+    subject: str,
+    body_text: str,
+    body_html: str = "",
+    context_data: dict = None,
+    status: str = "pending_approval",
+    requires_approval: bool = True
+) -> int:
+    init_tables()
+    with _conn() as c:
+        cur = c.cursor()
+        cur.execute("""
+            INSERT INTO lockin_email_drafts (
+                project_id, user_id, workflow_type, recipient, subject,
+                body_text, body_html, context_data, status, requires_approval, created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+            RETURNING id;
+        """, (
+            project_id, user_id, workflow_type, recipient, subject,
+            body_text, body_html, json.dumps(context_data or {}), status, requires_approval
+        ))
+        draft_id = cur.fetchone()[0]
+        c.commit()
+    return draft_id
+
+
+def get_email_draft(draft_id: int, user_id: str) -> dict | None:
+    init_tables()
+    with _conn() as c:
+        cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT * FROM lockin_email_drafts
+            WHERE id = %s AND user_id = %s;
+        """, (draft_id, user_id))
+        row = cur.fetchone()
+        if not row:
+            return None
+        res = dict(row)
+        if isinstance(res.get("context_data"), str):
+            try:
+                res["context_data"] = json.loads(res["context_data"])
+            except Exception:
+                pass
+        return res
+
+
+def get_project_email_drafts(project_id: int, user_id: str, status: Optional[str] = None, limit: int = 30) -> list[dict]:
+    init_tables()
+    with _conn() as c:
+        cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        if status:
+            cur.execute("""
+                SELECT * FROM lockin_email_drafts
+                WHERE project_id = %s AND user_id = %s AND status = %s
+                ORDER BY created_at DESC LIMIT %s;
+            """, (project_id, user_id, status, limit))
+        else:
+            cur.execute("""
+                SELECT * FROM lockin_email_drafts
+                WHERE project_id = %s AND user_id = %s
+                ORDER BY created_at DESC LIMIT %s;
+            """, (project_id, user_id, limit))
+        rows = cur.fetchall()
+        res = []
+        for r in rows:
+            d = dict(r)
+            if isinstance(d.get("context_data"), str):
+                try:
+                    d["context_data"] = json.loads(d["context_data"])
+                except Exception:
+                    pass
+            res.append(d)
+        return res
+
+
+def update_email_draft(draft_id: int, user_id: str, updates: dict) -> dict | None:
+    init_tables()
+    with _conn() as c:
+        cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            UPDATE lockin_email_drafts
+            SET recipient = COALESCE(%s, recipient),
+                subject = COALESCE(%s, subject),
+                body_text = COALESCE(%s, body_text),
+                body_html = COALESCE(%s, body_html),
+                status = COALESCE(%s, status),
+                updated_at = now()
+            WHERE id = %s AND user_id = %s
+            RETURNING *;
+        """, (
+            updates.get("recipient"),
+            updates.get("subject"),
+            updates.get("body_text"),
+            updates.get("body_html"),
+            updates.get("status"),
+            draft_id,
+            user_id
+        ))
+        row = cur.fetchone()
+        if not row:
+            return None
+        c.commit()
+        res = dict(row)
+        if isinstance(res.get("context_data"), str):
+            try:
+                res["context_data"] = json.loads(res["context_data"])
+            except Exception:
+                pass
+        return res
+
+
+def mark_email_draft_sent(draft_id: int, user_id: str, message_id: str) -> dict | None:
+    init_tables()
+    with _conn() as c:
+        cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            UPDATE lockin_email_drafts
+            SET status = 'sent', sent_message_id = %s, approved_at = COALESCE(approved_at, now()), sent_at = now(), updated_at = now()
+            WHERE id = %s AND user_id = %s
+            RETURNING *;
+        """, (message_id, draft_id, user_id))
+        row = cur.fetchone()
+        if not row:
+            return None
+        c.commit()
+        return dict(row)
+
+
+def mark_email_draft_rejected(draft_id: int, user_id: str, reason: str = "") -> dict | None:
+    init_tables()
+    with _conn() as c:
+        cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            UPDATE lockin_email_drafts
+            SET status = 'rejected', error = %s, updated_at = now()
+            WHERE id = %s AND user_id = %s
+            RETURNING *;
+        """, (reason, draft_id, user_id))
+        row = cur.fetchone()
+        if not row:
+            return None
+        c.commit()
+        return dict(row)
 
 
 def disconnect_gmail(user_id: str) -> bool:
@@ -890,6 +1238,9 @@ def get_all_active_projects_for_scheduler() -> list[dict]:
                 pref.recovery_enabled,
                 pref.reminder_time,
                 pref.timezone,
+                pref.automation_mode,
+                pref.is_paused,
+                pref.daily_send_limit,
                 g.google_email,
                 g.status AS gmail_status
             FROM lockin_projects p
@@ -897,6 +1248,7 @@ def get_all_active_projects_for_scheduler() -> list[dict]:
             LEFT JOIN gmail_connections g ON p.user_id = g.user_id
             WHERE p.status = 'active' 
               AND pref.email_enabled = TRUE
+              AND (pref.is_paused IS FALSE OR pref.is_paused IS NULL)
               AND g.status = 'active'
               AND g.refresh_token IS NOT NULL;
         """)

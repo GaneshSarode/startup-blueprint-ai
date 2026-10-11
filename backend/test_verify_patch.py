@@ -1,8 +1,9 @@
 """Verify post-patch state of ChromaDB SQLite and backend init."""
 import sys, os, json, sqlite3
-sys.path.insert(0, 'C:/Users/SAHIL DESAI/OneDrive/Documents/hackthon/backend')
-sys.path.insert(0, 'C:/Users/SAHIL DESAI/OneDrive/Documents/hackthon/backend/core')
-os.chdir('C:/Users/SAHIL DESAI/OneDrive/Documents/hackthon/backend')
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+sys.path.insert(0, os.path.join(_HERE, 'core'))
+os.chdir(_HERE)
 
 from config import get_settings
 settings = get_settings()

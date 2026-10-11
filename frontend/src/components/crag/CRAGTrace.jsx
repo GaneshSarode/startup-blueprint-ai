@@ -1,10 +1,48 @@
-import { useState } from 'react'
+﻿import { useState } from 'react'
 import { ChevronDown, ChevronUp } from 'lucide-react'
 
-const CONFIDENCE_STYLE = {
-  CORRECT:   { cls: 'text-emerald-400 border-emerald-500/25 bg-emerald-500/[0.065]', label: '✅ CORRECT — internal knowledge base was strongly relevant' },
-  AMBIGUOUS: { cls: 'text-amber-400  border-amber-500/25  bg-amber-500/[0.065]',  label: '⚡ AMBIGUOUS — combined PDF + live web search' },
-  INCORRECT: { cls: 'text-red-400   border-red-500/25    bg-red-500/[0.065]',    label: '❌ INCORRECT — knowledge base insufficient, web-only answer' },
+const CONFIDENCE_META = {
+  CORRECT: {
+    badge: { color:'#34d399', bg:'rgba(16,185,129,0.09)', border:'rgba(16,185,129,0.25)' },
+    summary: 'Internal knowledge base was strongly relevant. Blueprint grounded in verified PDF corpus.',
+    label: '✅ CORRECT',
+  },
+  AMBIGUOUS: {
+    badge: { color:'#fbbf24', bg:'rgba(234,179,8,0.09)', border:'rgba(234,179,8,0.25)' },
+    summary: 'Partial match in knowledge base. Web search used to supplement context.',
+    label: '⚡ AMBIGUOUS',
+  },
+  INCORRECT: {
+    badge: { color:'#f87171', bg:'rgba(239,68,68,0.09)', border:'rgba(239,68,68,0.25)' },
+    summary: 'Knowledge base insufficient. Tavily web search used as primary source.',
+    label: '❌ INCORRECT',
+  },
+}
+
+const NODES = {
+  CORRECT: [
+    ['retrieve',       'ChromaDB retrieval across text, table & visual chunks.'],
+    ['eval_each_doc',  'CrossEncoder scored chunks. Max logit ≥ −3.0 → CORRECT branch.'],
+    ['rewrite_query',  'Gemini Flash expanded idea into 10-field structured brief.'],
+    ['refine',         'Top-5 sentence-pair strips kept. Internal PDF knowledge sufficient.'],
+    ['generate',       'IBM Granite 4.0 synthesised policy brief from refined PDF context.'],
+    ['explore_search', 'Tavily fetched live results as bonus — not fed into blueprint.'],
+  ],
+  AMBIGUOUS: [
+    ['retrieve',      'ChromaDB queried all 3 collections; merged by cosine distance.'],
+    ['eval_each_doc', 'CrossEncoder scored chunks. Max logit between −6.5 and −3.0 → AMBIGUOUS.'],
+    ['rewrite_query', 'Gemini Flash expanded idea for Tavily queries.'],
+    ['web_search',    'Tavily searched live web to supplement weak retrieval.'],
+    ['refine',        'PDF sentence strips + Tavily snippets merged into combined context.'],
+    ['generate',      'IBM Granite 4.0 synthesised policy brief from combined sources.'],
+  ],
+  INCORRECT: [
+    ['retrieve',       'ChromaDB queried all 3 collections.'],
+    ['eval_each_doc',  'CrossEncoder scored chunks. Max logit < −6.5 → INCORRECT branch.'],
+    ['rewrite_query',  'Gemini Flash rewrote query for web search.'],
+    ['web_search',     'PDF corpus discarded. Tavily used as sole knowledge source.'],
+    ['conversational', 'Groq generated a plain market snapshot. No full blueprint produced.'],
+  ],
 }
 
 function ScoreBars({ logits }) {
@@ -12,53 +50,27 @@ function ScoreBars({ logits }) {
   const UPPER = -3.0, LOWER = -6.5
   return (
     <div>
-      <div className="text-[0.72rem] font-700 text-slate-400 mb-2">CrossEncoder Raw Logits</div>
+      <div style={{ fontSize:'0.72rem', fontWeight:700, color:'#94a3b8', marginBottom:8 }}>CrossEncoder Raw Logits</div>
       {logits.slice(0, 8).map((l, i) => {
         const pct   = Math.max(0, Math.min(100, ((l + 10) / 10) * 100))
         const color = l >= UPPER ? '#10b981' : l >= LOWER ? '#f59e0b' : '#ef4444'
         return (
-          <div key={i} className="flex items-center gap-2 mb-1.5">
-            <span className="font-mono text-[0.7rem] text-slate-500 w-12 flex-shrink-0">Doc {i+1}</span>
-            <div className="score-track flex-1">
-              <div className="score-fill" style={{ width: `${pct}%`, background: color }} />
+          <div key={i} style={{ display:'flex', alignItems:'center', gap:8, marginBottom:6 }}>
+            <span style={{ fontFamily:'JetBrains Mono,monospace', fontSize:'0.7rem', color:'#64748b', width:44, flexShrink:0 }}>Doc {i+1}</span>
+            <div className="score-track" style={{ flex:1 }}>
+              <div className="score-fill" style={{ width:`${pct}%`, background:color }} />
             </div>
-            <span className="font-mono text-[0.7rem] text-slate-500 w-12 text-right">{l.toFixed(2)}</span>
+            <span style={{ fontFamily:'JetBrains Mono,monospace', fontSize:'0.7rem', color:'#64748b', width:44, textAlign:'right' }}>{l.toFixed(2)}</span>
           </div>
         )
       })}
-      <div className="text-[0.67rem] text-slate-600 mt-1.5">
-        <span className="text-emerald-400">■</span> CORRECT ≥ {UPPER} &nbsp;·&nbsp;
-        <span className="text-amber-400">■</span> AMBIGUOUS &nbsp;·&nbsp;
-        <span className="text-red-400">■</span> INCORRECT &lt; {LOWER}
+      <div style={{ fontSize:'0.67rem', color:'#475569', marginTop:6 }}>
+        <span style={{ color:'#10b981' }}>■</span> ≥ {UPPER}&nbsp;·&nbsp;
+        <span style={{ color:'#f59e0b' }}>■</span> Ambiguous&nbsp;·&nbsp;
+        <span style={{ color:'#ef4444' }}>■</span> &lt; {LOWER}
       </div>
     </div>
   )
-}
-
-const NODES = {
-  CORRECT: [
-    ['✅', 'retrieve',        'Queried text_chunks + table_data + visual_summaries via Gemini embeddings, merged by cosine distance.'],
-    ['✅', 'eval_each_doc',   'CrossEncoder scored all chunks. Max logit above −3.0 → CORRECT branch.'],
-    ['✅', 'rewrite_query',   'Gemini Flash expanded idea into 10-field structured brief.'],
-    ['✅', 'refine',          'Sentence-pair strips re-scored; top-5 kept. Internal PDF knowledge sufficient.'],
-    ['✅', 'generate',        'IBM Granite 4.0 synthesized policy brief from refined PDF context.'],
-    ['✅', 'explore_search',  'Tavily fetched live web results as bonus — NOT fed into blueprint.'],
-  ],
-  AMBIGUOUS: [
-    ['✅', 'retrieve',        'Queried all 3 ChromaDB collections, merged by cosine distance.'],
-    ['✅', 'eval_each_doc',   'CrossEncoder scored chunks. Max logit between −6.5 and −3.0 → AMBIGUOUS branch.'],
-    ['✅', 'rewrite_query',   'Gemini Flash expanded idea into structured brief for Tavily queries.'],
-    ['✅', 'web_search',      'Tavily searched live web (inc42, startupindia, ET) to supplement weak retrieval.'],
-    ['✅', 'refine',          'PDF sentence strips + Tavily snippets merged into combined context.'],
-    ['✅', 'generate',        'IBM Granite 4.0 synthesized policy brief from combined sources.'],
-  ],
-  INCORRECT: [
-    ['✅', 'retrieve',        'Queried all 3 ChromaDB collections.'],
-    ['✅', 'eval_each_doc',   'CrossEncoder scored chunks. Max logit below −6.5 → INCORRECT branch.'],
-    ['✅', 'rewrite_query',   'Gemini Flash rewrote query for web search.'],
-    ['✅', 'web_search',      'PDF corpus discarded. Tavily used as sole knowledge source.'],
-    ['✅', 'conversational',  'Groq generated a plain market snapshot. No full blueprint produced.'],
-  ],
 }
 
 export default function CRAGTrace({ cragResult }) {
@@ -66,45 +78,91 @@ export default function CRAGTrace({ cragResult }) {
   if (!cragResult) return null
 
   const { confidence, action, raw_logits = [], sources = [], retrieval_queries = [], internal_context, external_context } = cragResult
-  const style = CONFIDENCE_STYLE[confidence] || CONFIDENCE_STYLE.INCORRECT
+  const meta  = CONFIDENCE_META[confidence] || CONFIDENCE_META.INCORRECT
   const nodes = NODES[confidence] || NODES.INCORRECT
 
+  // Build a concise collapsed summary from action or fall back to meta.summary
+  const collapsedSummary = (() => {
+    if (!action) return meta.summary
+    const stripped = action.replace(/^[\u2713✅⚡❌✓\s]+/, '').trim()
+    if (stripped.length < 10) return meta.summary
+    return stripped.length > 120 ? stripped.slice(0, 120) + '…' : stripped
+  })()
+
   return (
-    <div className="mb-5 rounded-2xl border border-white/[0.062] bg-white/[0.014] overflow-hidden">
-      {/* Header — always visible */}
+    <div style={{
+      marginBottom:20,
+      borderRadius:16,
+      border:'1px solid rgba(255,255,255,0.062)',
+      background:'rgba(255,255,255,0.014)',
+      overflow:'hidden'
+    }}>
+      {/* ── Collapsed header ── */}
       <button
+        type="button"
         onClick={() => setOpen(!open)}
-        className="w-full flex items-center justify-between px-5 py-3.5 hover:bg-white/[0.022] transition-colors"
+        aria-expanded={open}
+        aria-controls="crag-detail"
+        style={{
+          width:'100%', display:'flex', alignItems:'center', justifyContent:'space-between',
+          padding:'12px 20px', background:'none', border:'none', cursor:'pointer',
+          textAlign:'left'
+        }}
+        className="hover:bg-white/[0.022] transition-colors"
       >
-        <div className="flex items-center gap-3">
-          <span className={`text-xs font-700 px-3 py-1 rounded-full border ${style.cls}`}>
-            CRAG: {confidence}
+        <div style={{ display:'flex', alignItems:'center', gap:10, minWidth:0, flex:1 }}>
+          {/* Confidence badge */}
+          <span style={{
+            fontSize:'0.7rem', fontWeight:700,
+            padding:'2px 10px', borderRadius:99,
+            color: meta.badge.color,
+            background: meta.badge.bg,
+            border: `1px solid ${meta.badge.border}`,
+            flexShrink:0, whiteSpace:'nowrap'
+          }}>
+            {meta.label}
           </span>
-          <span className="text-xs text-slate-500">{action?.slice(2, 80)}…</span>
+          {/* Concise summary */}
+          <span style={{ fontSize:'0.8rem', color:'#64748b', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+            {collapsedSummary}
+          </span>
         </div>
-        {open ? <ChevronUp size={16} className="text-slate-500"/> : <ChevronDown size={16} className="text-slate-500"/>}
+        <span style={{ color:'#64748b', flexShrink:0, marginLeft:12 }}>
+          {open ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+        </span>
       </button>
 
-      {/* Expanded detail */}
+      {/* ── Expanded detail ── */}
       {open && (
-        <div className="px-5 pb-5 animate-fade-in">
-          <div className={`rounded-xl border px-4 py-3 text-sm font-600 mb-4 ${style.cls}`}>
-            {style.label}
+        <div id="crag-detail" className="animate-fade-in" style={{ padding:'0 20px 20px' }}>
+
+          {/* Decision banner */}
+          <div style={{
+            borderRadius:10, border:`1px solid ${meta.badge.border}`,
+            background: meta.badge.bg,
+            padding:'10px 14px', marginBottom:16,
+            fontSize:'0.8rem', fontWeight:600,
+            color: meta.badge.color,
+            lineHeight:1.5
+          }}>
+            {meta.label} — {meta.summary}
           </div>
 
-          {/* Pipeline nodes */}
-          <div className="mb-4">
-            <div className="text-[0.67rem] font-700 text-slate-500 uppercase tracking-wider mb-3">
+          {/* Pipeline trace */}
+          <div style={{ marginBottom:16 }}>
+            <div style={{ fontSize:'0.67rem', fontWeight:700, color:'#475569', textTransform:'uppercase', letterSpacing:'0.09em', marginBottom:10 }}>
               Pipeline Trace — Yan et al. 2024
             </div>
-            {nodes.map(([icon, name, desc], i) => (
+            {nodes.map(([name, desc], i) => (
               <div key={i}>
-                <div className="flex items-start gap-3 py-2 px-3 rounded-xl border border-emerald-500/18 bg-emerald-500/[0.022]">
-                  <span className="text-sm flex-shrink-0 mt-0.5">{icon}</span>
-                  <div>
-                    <div className="text-xs font-700 text-emerald-400 mb-0.5">Node · {name}</div>
-                    <div className="text-xs text-slate-500 leading-relaxed">{desc}</div>
-                  </div>
+                <div style={{
+                  display:'flex', alignItems:'flex-start', gap:10,
+                  padding:'8px 12px', borderRadius:10,
+                  border:'1px solid rgba(16,185,129,0.18)',
+                  background:'rgba(16,185,129,0.022)',
+                }}>
+                  <span style={{ fontSize:'0.75rem', fontWeight:700, color:'#34d399', flexShrink:0, minWidth:0 }}>✅ {name}</span>
+                  <span style={{ fontSize:'0.75rem', color:'#64748b', lineHeight:1.55 }}>{desc}</span>
                 </div>
                 {i < nodes.length - 1 && <div className="crag-connector" />}
               </div>
@@ -112,44 +170,50 @@ export default function CRAGTrace({ cragResult }) {
           </div>
 
           {/* Logits + sources */}
-          <div className="grid md:grid-cols-2 gap-5">
-            <ScoreBars logits={raw_logits} />
-            <div>
-              <div className="text-[0.72rem] font-700 text-slate-400 mb-2">Sources Used</div>
-              {sources.map((s, i) => (
-                <div key={i} className="flex items-center gap-2 text-xs text-slate-400 py-1">
-                  <span>{s === 'tavily_web_search' ? '🌐' : '📄'}</span>
-                  <code className="text-blue-400 bg-blue-500/[0.08] px-2 py-0.5 rounded text-[0.7rem]">{s}</code>
-                </div>
-              ))}
-              {retrieval_queries?.length > 0 && (
-                <>
-                  <div className="text-[0.72rem] font-700 text-slate-400 mt-3 mb-2">Tavily Queries</div>
-                  {retrieval_queries.slice(0, 3).map((q, i) => (
-                    <div key={i} className="text-xs text-slate-500 bg-white/[0.022] border border-white/[0.048] rounded-lg px-3 py-1.5 mb-1 leading-relaxed">
-                      {q}
+          {(raw_logits.length > 0 || sources.length > 0) && (
+            <div className="grid md:grid-cols-2 gap-5" style={{ marginBottom:14 }}>
+              <ScoreBars logits={raw_logits} />
+              {sources.length > 0 && (
+                <div>
+                  <div style={{ fontSize:'0.72rem', fontWeight:700, color:'#94a3b8', marginBottom:8 }}>Sources Used</div>
+                  {sources.map((s, i) => (
+                    <div key={i} style={{ display:'flex', alignItems:'center', gap:8, fontSize:'0.75rem', color:'#94a3b8', padding:'4px 0' }}>
+                      <span>{s === 'tavily_web_search' ? '🌐' : '📄'}</span>
+                      <code style={{ color:'#60a5fa', background:'rgba(59,130,246,0.08)', padding:'1px 6px', borderRadius:6, fontSize:'0.7rem' }}>{s}</code>
                     </div>
                   ))}
-                </>
+                  {retrieval_queries?.length > 0 && (
+                    <>
+                      <div style={{ fontSize:'0.72rem', fontWeight:700, color:'#94a3b8', marginTop:12, marginBottom:8 }}>Tavily Queries</div>
+                      {retrieval_queries.slice(0, 3).map((q, i) => (
+                        <div key={i} style={{
+                          fontSize:'0.75rem', color:'#64748b', lineHeight:1.55,
+                          background:'rgba(255,255,255,0.022)', border:'1px solid rgba(255,255,255,0.048)',
+                          borderRadius:8, padding:'6px 10px', marginBottom:4
+                        }}>{q}</div>
+                      ))}
+                    </>
+                  )}
+                </div>
               )}
             </div>
-          </div>
+          )}
 
           {/* Contexts */}
           {(internal_context || external_context) && (
-            <div className="grid md:grid-cols-2 gap-4 mt-4">
+            <div className="grid md:grid-cols-2 gap-4">
               {internal_context && (
                 <div>
-                  <div className="text-[0.67rem] font-700 text-slate-500 uppercase tracking-wider mb-2">📄 PDF Context (refined)</div>
-                  <div className="text-xs text-slate-500 bg-white/[0.022] border border-white/[0.048] rounded-xl p-3 leading-relaxed max-h-36 overflow-y-auto">
+                  <div style={{ fontSize:'0.67rem', fontWeight:700, color:'#475569', textTransform:'uppercase', letterSpacing:'0.09em', marginBottom:8 }}>📄 PDF Context (refined)</div>
+                  <div style={{ fontSize:'0.75rem', color:'#64748b', background:'rgba(255,255,255,0.022)', border:'1px solid rgba(255,255,255,0.048)', borderRadius:10, padding:12, lineHeight:1.6, maxHeight:144, overflowY:'auto' }}>
                     {internal_context.slice(0, 600)}…
                   </div>
                 </div>
               )}
               {external_context && (
                 <div>
-                  <div className="text-[0.67rem] font-700 text-slate-500 uppercase tracking-wider mb-2">🌐 Web Context (Tavily)</div>
-                  <div className="text-xs text-slate-500 bg-white/[0.022] border border-white/[0.048] rounded-xl p-3 leading-relaxed max-h-36 overflow-y-auto">
+                  <div style={{ fontSize:'0.67rem', fontWeight:700, color:'#475569', textTransform:'uppercase', letterSpacing:'0.09em', marginBottom:8 }}>🌐 Web Context (Tavily)</div>
+                  <div style={{ fontSize:'0.75rem', color:'#64748b', background:'rgba(255,255,255,0.022)', border:'1px solid rgba(255,255,255,0.048)', borderRadius:10, padding:12, lineHeight:1.6, maxHeight:144, overflowY:'auto' }}>
                     {external_context.slice(0, 600)}…
                   </div>
                 </div>
