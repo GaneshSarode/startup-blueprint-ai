@@ -1,4 +1,5 @@
 import { Card } from '../ui'
+import StartupBudgetCalculator from './StartupBudgetCalculator'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts'
 
 export default function BudgetTab({ data }) {
@@ -12,6 +13,8 @@ export default function BudgetTab({ data }) {
     total: p.total || 0
   })) || []
 
+  const estimatedAnnualCost = Number(data.total_12_months) || chartData.reduce((sum, phase) => sum + phase.total, 0)
+  const suggestedMonthlyCost = estimatedAnnualCost / 12
   const pieColors = ['#3b82f6', '#8b5cf6', '#10b981']
 
   const renderCustomizedLabel = ({ cx, cy, midAngle, innerRadius, outerRadius, percent, index }) => {
@@ -121,6 +124,9 @@ export default function BudgetTab({ data }) {
           </Card>
         ))}
       </div>
+
+      {/* Interactive cash-flow planning tool */}
+      <StartupBudgetCalculator suggestedMonthlyCost={suggestedMonthlyCost} />
     </div>
   )
 }
